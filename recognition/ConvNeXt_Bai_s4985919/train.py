@@ -27,6 +27,7 @@ from torch.utils.data import DataLoader, Subset
 
 from dataset import (load_datasets, load_patient_map, get_transform,
                      MRIAugmentedTrainingSet, SPLIT_MODES, INPUT_MODES)
+from mri_intensity import intensity_protocol, make_training_input
 from predict import (create_records, evaluate, get_sample_info,
                      patient_mapping_fingerprint)
 from baseline import SimpleCNN
@@ -241,6 +242,7 @@ def save_progress(output_dir, model, optimizer, args, fingerprint, epoch,
         "optimizer_name": args.optimizer,
         "weight_decay": args.weight_decay,
         "training_augmentation": args.augment,
+        "intensity_augmentation": intensity_protocol(args.intensity_augment),
         "seed": args.seed,
         "max_train_batches": args.max_train_batches,
         "max_val_batches": args.max_val_batches,
@@ -367,6 +369,8 @@ def main():
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--augment", action="store_true",
                         help="Enable mild geometric/noise augmentation on TRAIN only")
+    parser.add_argument("--intensity-augment", action="store_true",
+                        help="TRAIN only: fixed scale/Gamma 0.9-1.1 before original augmentation")
     parser.add_argument("--selection-level", choices=["slice", "scan", "patient"],
                         default="slice", help="Level used to choose best.pth on validation")
     parser.add_argument("--selection-threshold", type=float, default=0.5,
@@ -413,6 +417,8 @@ def main():
         parser.error("warmup-epochs and num-workers cannot be negative")
     if args.weight_decay < 0:
         parser.error("weight-decay cannot be negative")
+    if args.intensity_augment and (not args.augment or args.model != "convnext"):
+        parser.error("--intensity-augment requires --model convnext --augment")
     if any(v is not None and v <= 0 for v in
            (args.max_train_batches, args.max_val_batches)):
         parser.error("max-train-batches and max-val-batches must be positive")
@@ -477,6 +483,7 @@ def main():
         )
     print("Optimizer:", args.optimizer, "weight decay:", args.weight_decay)
     print("Train-only augmentation:", args.augment)
+    print("Train-only intensity protocol:", intensity_protocol(args.intensity_augment))
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
     val_criterion = nn.CrossEntropyLoss()  # plain CE keeps val loss comparable across runs
     print("Selected model:", args.model)
@@ -497,6 +504,7 @@ def main():
             "learning_rate": args.learning_rate, "seed": args.seed,
             "optimizer_name": args.optimizer, "weight_decay": args.weight_decay,
             "training_augmentation": args.augment,
+            "intensity_augmentation": intensity_protocol(args.intensity_augment),
             "max_train_batches": args.max_train_batches,
             "max_val_batches": args.max_val_batches,
             "split_fingerprint": fingerprint,
@@ -561,6 +569,7 @@ def main():
             "optimizer_name": args.optimizer,
             "weight_decay": args.weight_decay,
             "training_augmentation": args.augment,
+            "intensity_augmentation": intensity_protocol(args.intensity_augment),
             "target_epochs": args.epochs,
             "train_images": len(train_dataset), "val_images": len(val_dataset),
             "test_images": len(test_dataset),
@@ -600,10 +609,8 @@ def main():
 
     # Keep the original dataset unchanged for patient-level split auditing,
     # fingerprinting, and validation. Augmentation wraps only training images.
-    training_input = (
-        MRIAugmentedTrainingSet(train_dataset)
-        if args.augment else train_dataset
-    )
+    training_input = make_training_input(train_dataset, args.augment,
+                                         args.intensity_augment, MRIAugmentedTrainingSet)
     samples_per_epoch = len(training_input)
     if args.max_train_batches is not None:
         samples_per_epoch = min(samples_per_epoch, args.max_train_batches * args.batch_size)
@@ -684,6 +691,7 @@ def main():
                 "selection_accuracy": metrics["selection_accuracy"],
                 "split_mode": args.split_mode,
                 "input_mode": args.input_mode,
+                "intensity_augmentation": intensity_protocol(args.intensity_augment),
                 "weights": "ema" if ema_model is not None else "raw",
                 "scheduler": args.scheduler,
                 "label_smoothing": args.label_smoothing,

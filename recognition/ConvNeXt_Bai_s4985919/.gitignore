@@ -15,3 +15,13 @@ diagnostics/
 *.jpg
 # Medical images are never committed; approved self-made report charts may be committed under docs/figures.
 # Keep only intentionally selected, approved figures in docs/figures if allowed.
+# Slurm logs and evaluation outputs (may contain data paths); keep out of git.
+*.out
+*.err
+eval_*/
+evaluation_*/
+evidence/
+*.tar.gz
+# Raw scan IDs and MRI montages from analyze.py stay local even if copied elsewhere.
+*LOCAL_ONLY*
+failure_cases_montage.png

@@ -187,7 +187,9 @@ class IntensityTests(unittest.TestCase):
         args = SimpleNamespace(model='convnext', batch_size=8, learning_rate=.0003, seed=42,
                                optimizer='adamw', weight_decay=.03, augment=True,
                                intensity_augment=False, max_train_batches=None,
-                               max_val_batches=None, selection_level='slice', selection_threshold=.5)
+                               max_val_batches=None, selection_level='slice', selection_threshold=.5,
+                               split_mode='strict', input_mode='single', scheduler='none',
+                               warmup_epochs=1.0, ema_decay=0.0, label_smoothing=0.0)
         namespace = dict(args=args, fingerprint={'train': 'synthetic'},
                          intensity_protocol=mi.intensity_protocol)
         expected = eval(compile(ast.Expression(loop.iter.func.value), 'resume-settings', 'eval'), namespace)
