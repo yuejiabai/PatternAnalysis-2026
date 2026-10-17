@@ -1,0 +1,417 @@
+"""COMP3710 ADNI: reproducible slice/scan/patient inference and evaluation.
+
+Use *validation* to verify the locked protocol before running the official test.
+The test split is guarded by --confirm-final-test to discourage tuning on test.
+No training or model selection occurs in this script.
+
+Example (previously chosen on validation):
+    python -u predict.py --split validation --threshold 0.67
+    python -u predict.py --split test --threshold 0.67 --confirm-final-test
+
+AD=0 (positive class), NC=1. Scan predictions average 20 slice AD
+probabilities; patient predictions average the scores of that patient's scans.
+Patient-level accuracy is reported only for patients with consistent labels
+across visits. Report any excluded patients rather than hiding them.
+
+Warning: Test labels and MRI slices are course/restricted data. Keep outputs
+local and check ADNI data-use rules before publishing derived images/details.
+"""
+
+import argparse
+import csv
+import hashlib
+import json
+import math
+import time
+from collections import defaultdict
+from pathlib import Path
+
+import torch
+from torch.utils.data import DataLoader, Subset
+
+from dataset import get_image_id, load_datasets, load_patient_map
+from modules import ConvNeXt
+from baseline import SimpleCNN
+from dataset import transform
+
+
+DEFAULT_CHECKPOINT = Path(
+    "checkpoints/convnext/convnext_aug_adamw_run01/best.pth"
+)
+
+
+def fingerprint_split(dataset):
+    """Identical algorithm to train.py; detect changed membership/order/labels."""
+    samples = get_sample_info(dataset)
+    digest = hashlib.sha256()
+    for path, label in samples:
+        digest.update(f"{path}\t{label}\n".encode("utf-8"))
+    return digest.hexdigest()
+
+
+def patient_mapping_fingerprint(datasets, patient_map):
+    """Hash relevant scan-to-patient links, without saving private IDs."""
+    scan_ids = sorted({get_image_id(path)
+                       for dataset in datasets
+                       for path, _ in get_sample_info(dataset)})
+    digest = hashlib.sha256()
+    for scan_id in scan_ids:
+        patient_id = patient_map.get(scan_id)
+        if patient_id is None:
+            raise ValueError(f"Missing metadata patient for scan {scan_id}")
+        digest.update(f"{scan_id}\t{patient_id}\n".encode("utf-8"))
+    return digest.hexdigest()
+
+
+def load_best_metadata(checkpoint):
+    """Old raw weight files have no metadata; keep them loadable with a warning."""
+    metadata_path = checkpoint.with_name("best_meta.json")
+    if not metadata_path.is_file():
+        return None
+    with metadata_path.open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def check_checkpoint_compatibility(metadata, args, train_ds, val_ds, test_ds, patient_map):
+    if metadata is None:
+        print("WARNING: Legacy best.pth has no best_meta.json. "
+              "Split and preprocessing fingerprint CANNOT be independently verified.")
+        return
+    if metadata.get("smoke_test") and args.split == "test":
+        raise ValueError("Smoke-test weights must not be evaluated on official test")
+    if metadata.get("model") != args.model:
+        raise ValueError("Model mismatch: checkpoint was trained as "
+                         f"{metadata.get('model')!r}, requested {args.model!r}")
+    if metadata.get("class_to_idx") != {"AD": 0, "NC": 1}:
+        raise ValueError("Class mapping mismatch in checkpoint metadata")
+    if metadata.get("preprocessing_repr") != repr(transform):
+        raise ValueError("Preprocessing mismatch between trained model and dataset.py")
+    expected = metadata.get("split_fingerprint")
+    if not isinstance(expected, dict) or set(expected) != {"train", "validation", "test"}:
+        raise ValueError("Incomplete split fingerprint in best_meta.json")
+    actual = {"train": fingerprint_split(train_ds),
+              "validation": fingerprint_split(val_ds),
+              "test": fingerprint_split(test_ds)}
+    for split in actual:
+        if expected[split] != actual[split]:
+            raise ValueError(f"{split} patient split/membership/order mismatch; "
+                             "do not compare these metrics with the checkpoint")
+    expected_patient = metadata.get("patient_mapping_fingerprint")
+    if not expected_patient:
+        raise ValueError("Checkpoint missing patient mapping fingerprint; check metadata version")
+    actual_patient = patient_mapping_fingerprint((train_ds, val_ds, test_ds), patient_map)
+    if expected_patient != actual_patient:
+        raise ValueError("Patient mapping mismatch; metadata identity changed since training")
+    print("Checkpoint model, class map, preprocessing, split and patient mapping fingerprints verified.")
+
+def get_sample_info(dataset):
+    """Return (path, label) in exactly DataLoader(shuffle=False) order."""
+    if isinstance(dataset, Subset):
+        source, indices = dataset.dataset, dataset.indices
+    else:
+        source, indices = dataset, range(len(dataset))
+    if getattr(source, "class_to_idx", None) != {"AD": 0, "NC": 1}:
+        raise ValueError("Expected ImageFolder mapping {'AD': 0, 'NC': 1}")
+    if not hasattr(source, "samples"):
+        raise TypeError("Expected ImageFolder or Subset(ImageFolder)")
+    return [source.samples[int(i)] for i in indices]
+
+
+def create_records(samples, scores, patient_map):
+    """Aggregate slice AD probabilities into scan and patient records.
+
+    One scan is represented by one image-id prefix; patient identifiers come
+    only from dataset.py's metadata mapping, NOT from the image-id prefix.
+    Equal weight is given to each scan in a patient's average.
+    """
+    if len(samples) != len(scores):
+        raise ValueError("Sample count does not match prediction count")
+
+    slices = []
+    scan_groups = defaultdict(list)
+    for (path, label), score in zip(samples, scores):
+        if label not in (0, 1) or not (0.0 <= score <= 1.0) or not math.isfinite(score):
+            raise ValueError("Invalid label or AD probability")
+        scan_id = get_image_id(path)
+        patient_id = patient_map.get(scan_id)
+        if patient_id is None:
+            raise ValueError(f"Missing patient mapping for scan {scan_id}")
+        slices.append((str(path), float(score), label))
+        scan_groups[scan_id].append((patient_id, float(score), label))
+
+    scans = []
+    patient_groups = defaultdict(list)
+    unusual_scan_sizes = []
+    for scan_id, entries in scan_groups.items():
+        patients = {p for p, _, _ in entries}
+        diagnoses = {y for _, _, y in entries}
+        if len(patients) != 1 or len(diagnoses) != 1:
+            raise ValueError(f"Inconsistent labels or patient IDs within scan {scan_id}")
+        patient_id = next(iter(patients))
+        label = next(iter(diagnoses))
+        probability = sum(p for _, p, _ in entries) / len(entries)
+        scans.append((scan_id, probability, label))
+        patient_groups[patient_id].append((probability, label))
+        if len(entries) != 20:
+            unusual_scan_sizes.append((scan_id, len(entries)))
+
+    patients = []
+    mixed_patients = []
+    for patient_id, entries in patient_groups.items():
+        diagnoses = {label for _, label in entries}
+        if len(diagnoses) != 1:
+            mixed_patients.append(patient_id)
+            continue
+        # Scan-balanced mean: each visit contributes equally, even if its
+        # number of slices differs from other visits.
+        probability = sum(p for p, _ in entries) / len(entries)
+        patients.append((patient_id, probability, next(iter(diagnoses))))
+
+    return {
+        "slice": slices,
+        "scan": scans,
+        "patient": patients,
+        "total_patients": len(patient_groups),
+        "excluded_mixed_label_patients": len(mixed_patients),
+        "unusual_scan_sizes": unusual_scan_sizes,
+    }
+
+
+def rank_auroc(scores, labels):
+    """AUROC with AD (label=0) positive, using tied mid-ranks."""
+    pos = sum(y == 0 for y in labels)
+    neg = sum(y == 1 for y in labels)
+    if pos == 0 or neg == 0:
+        return None
+    ranked = sorted(zip(scores, labels))
+    rank_sum = 0.0
+    i = 0
+    while i < len(ranked):
+        j = i + 1
+        while j < len(ranked) and ranked[j][0] == ranked[i][0]:
+            j += 1
+        mid_rank = ((i + 1) + j) / 2.0
+        rank_sum += mid_rank * sum(y == 0 for _, y in ranked[i:j])
+        i = j
+    return (rank_sum - pos * (pos + 1) / 2) / (pos * neg)
+
+
+def evaluate(records, threshold):
+    """Classification metrics for AD positive, NC negative."""
+    if not records:
+        return None
+    scores = [score for _, score, _ in records]
+    labels = [label for _, _, label in records]
+    predictions = [0 if score >= threshold else 1 for score in scores]
+    tp = sum(y == 0 and p == 0 for y, p in zip(labels, predictions))
+    fn = sum(y == 0 and p == 1 for y, p in zip(labels, predictions))
+    fp = sum(y == 1 and p == 0 for y, p in zip(labels, predictions))
+    tn = sum(y == 1 and p == 1 for y, p in zip(labels, predictions))
+
+    def div(a, b):
+        return a / b if b else 0.0
+
+    precision_ad = div(tp, tp + fp)
+    precision_nc = div(tn, tn + fn)
+    recall_ad = div(tp, tp + fn)
+    recall_nc = div(tn, tn + fp)
+    f1_ad = div(2 * precision_ad * recall_ad, precision_ad + recall_ad)
+    f1_nc = div(2 * precision_nc * recall_nc, precision_nc + recall_nc)
+
+    # For operational triage, confidence is the probability of the selected
+    # class, not a calibrated probability of being correct.
+    confidence = [s if p == 0 else (1 - s) for s, p in zip(scores, predictions)]
+    review_mask = [c < 0.80 for c in confidence]
+    accepted = [p == y for p, y, needs_review in zip(predictions, labels, review_mask)
+                if not needs_review]
+    accepted_accuracy = sum(accepted) / len(accepted) if accepted else None
+
+    return {
+        "n": len(records),
+        "accuracy": div(tp + tn, len(records)),
+        "correct": tp + tn,
+        "precision_ad": precision_ad,
+        "recall_ad": recall_ad,
+        "f1_ad": f1_ad,
+        "precision_nc": precision_nc,
+        "recall_nc": recall_nc,
+        "f1_nc": f1_nc,
+        "macro_precision": (precision_ad + precision_nc) / 2,
+        "macro_recall": (recall_ad + recall_nc) / 2,
+        "macro_f1": (f1_ad + f1_nc) / 2,
+        "auroc_ad": rank_auroc(scores, labels),
+        "tp_ad": tp, "fn_ad": fn, "fp_ad": fp, "tn_ad": tn,
+        "triage_example_confidence_cutoff": 0.80,
+        "triage_example_review_count": sum(review_mask),
+        "triage_example_coverage": 1 - sum(review_mask) / len(records),
+        "triage_example_accepted_accuracy": accepted_accuracy,
+    }
+
+
+def print_metrics(level, result):
+    if result is None:
+        print(f"{level}: unavailable")
+        return
+    auc = "n/a" if result["auroc_ad"] is None else f"{result['auroc_ad']:.4f}"
+    print(
+        f"{level.upper():7s} {result['correct']}/{result['n']} correct, "
+        f"accuracy={result['accuracy']:.4f}, macro-F1={result['macro_f1']:.4f}, "
+        f"AD recall={result['recall_ad']:.4f}, NC recall={result['recall_nc']:.4f}, "
+        f"AUROC_AD={auc}"
+    )
+    print(
+        f"         AD: TP={result['tp_ad']} FN={result['fn_ad']}; "
+        f"NC: FP={result['fp_ad']} TN={result['tn_ad']}; "
+        f"P_AD={result['precision_ad']:.4f}, P_NC={result['precision_nc']:.4f}"
+    )
+
+
+def anonymized_id(identifier, salt):
+    return hashlib.sha256((salt + ":" + str(identifier)).encode("utf-8")).hexdigest()[:14]
+
+
+def save_anonymized_details(path, records, threshold, salt):
+    # Do not write raw patient IDs, scan IDs, or source paths into a public CSV.
+    # Salt is user-provided if distinct files need stable pseudonymous IDs.
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["anonymous_id", "true_class", "predicted_class", "probability_ad", "correct"])
+        for identifier, score, label in records:
+            predicted = 0 if score >= threshold else 1
+            writer.writerow([
+                anonymized_id(identifier, salt), "AD" if label == 0 else "NC",
+                "AD" if predicted == 0 else "NC", f"{score:.6f}", int(predicted == label)
+            ])
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--split", choices=["validation", "test"], default="validation")
+    p.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
+    p.add_argument("--model", choices=["convnext", "cnn"], default="convnext",
+                   help="Architecture to load; explicit for legacy checkpoints")
+    p.add_argument("--threshold", type=float, default=None,
+                   help="AD cutoff; default uses saved best_meta.json, else 0.50")
+    p.add_argument("--batch-size", type=int, default=16)
+    p.add_argument("--output-dir", type=Path, default=Path("evaluation_results"))
+    p.add_argument("--confirm-final-test", action="store_true",
+                   help="Explicit approval to score the untouched official test split")
+    p.add_argument("--save-details", action="store_true",
+                   help="Write pseudonymous slice/scan/patient prediction CSVs")
+    p.add_argument("--id-salt", default="local-analysis-only",
+                   help="Salt for pseudonymous IDs; do not publish detailed CSVs")
+    args = p.parse_args()
+    if args.threshold is not None and not (0 < args.threshold < 1):
+        p.error("Threshold must be strictly between 0 and 1")
+    if args.batch_size < 1:
+        p.error("Batch size must be >= 1")
+    if args.split == "test" and not args.confirm_final_test:
+        p.error("Official test evaluation requires --confirm-final-test")
+    if not args.checkpoint.is_file():
+        p.error(f"Checkpoint not found: {args.checkpoint}")
+    return args
+
+
+def main():
+    args = parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+    print(f"Split: {args.split.upper()}, checkpoint: {args.checkpoint}")
+    metadata = load_best_metadata(args.checkpoint)
+    if args.threshold is None:
+        args.threshold = (metadata.get("selection_threshold", 0.5)
+                          if metadata is not None else 0.5)
+        print("Threshold source:", "best_meta.json" if metadata else "legacy fallback 0.50")
+    elif metadata is not None and args.threshold != metadata.get("selection_threshold"):
+        print("WARNING: Manual threshold override. Document validation-only rationale; "
+              "NEVER select a threshold based on test metrics.")
+    print(f"Frozen primary AD threshold: {args.threshold:.2f}")
+    print("Preprocessing: dataset.py resize(224,224), grayscale-to-3, normalize(0.5)")
+
+    train_ds, val_ds, test_ds = load_datasets()
+    patient_map = load_patient_map()
+    check_checkpoint_compatibility(metadata, args, train_ds, val_ds, test_ds, patient_map)
+    ds = val_ds if args.split == "validation" else test_ds
+    samples = get_sample_info(ds)
+
+    model = (ConvNeXt(num_classes=2, in_channels=3)
+             if args.model == "convnext" else SimpleCNN()).to(device)
+    # The project's best.pth saves the raw state_dict (NOT the resume dict).
+    state = torch.load(args.checkpoint, map_location=device)
+    if not isinstance(state, dict) or "model_state" in state:
+        raise ValueError("Expected best.pth model weights, not last.pth resume checkpoint")
+    model.load_state_dict(state, strict=True)
+    model.eval()
+
+    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    labels_seen, scores = [], []
+    total_time = 0.0
+    with torch.inference_mode():
+        for images, labels in loader:
+            images = images.to(device)
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            start = time.perf_counter()
+            outputs = model(images)
+            probabilities = torch.softmax(outputs, dim=1)[:, 0]
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            total_time += time.perf_counter() - start
+            scores.extend(probabilities.cpu().tolist())
+            labels_seen.extend(labels.tolist())
+
+    if len(samples) != len(scores) or labels_seen != [label for _, label in samples]:
+        raise RuntimeError("Dataset sample order does not match model predictions")
+    records = create_records(samples, scores, patient_map)
+    print(
+        f"Evaluated: {len(records['slice'])} slices, {len(records['scan'])} scans, "
+        f"{records['total_patients']} patients"
+    )
+    print(f"Patients with inconsistent diagnoses (excluded from patient score): "
+          f"{records['excluded_mixed_label_patients']}")
+    print(f"Scans not containing exactly 20 slices: {len(records['unusual_scan_sizes'])}")
+
+    result_by_level = {}
+    for level in ("slice", "scan", "patient"):
+        metrics = evaluate(records[level], args.threshold)
+        result_by_level[level] = metrics
+        print_metrics(level, metrics)
+
+    print(f"Forward-pass latency: {1000 * total_time / max(len(scores), 1):.3f} ms/slice "
+          f"(batch-size={args.batch_size}; excludes file loading & transfer)")
+    print("NOTE: Scan- and patient-level scores are separate outcomes, NOT slice accuracy.")
+    print("NOTE: Confidence 0.80 triage metrics in JSON are illustrative, NOT calibrated.")
+
+    # Store only aggregate metrics by default; no raw MRIs, paths or patient IDs.
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    summary = {
+        "split": args.split,
+        "model": args.model,
+        "checkpoint_metadata_verified": metadata is not None,
+        "selection_level": metadata.get("selection_level") if metadata else "unknown_legacy",
+        "selection_threshold": metadata.get("selection_threshold") if metadata else None,
+        "checkpoint": args.checkpoint.as_posix(),
+        "threshold_ad": args.threshold,
+        "selection": "New best_meta.json verifies saved selection; legacy files are unverified",
+        "class_map": {"AD": 0, "NC": 1},
+        "num_scans_with_nonstandard_slice_count": len(records["unusual_scan_sizes"]),
+        "num_patients_total": records["total_patients"],
+        "num_patients_excluded_mixed_labels": records["excluded_mixed_label_patients"],
+        "inference_ms_per_slice_forward_only": 1000 * total_time / max(len(scores), 1),
+        "metrics": result_by_level,
+    }
+    path = args.output_dir / f"{args.split}_metrics.json"
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    print("Saved aggregate results:", path)
+
+    if args.save_details:
+        for level in ("slice", "scan", "patient"):
+            csv_path = args.output_dir / f"{args.split}_{level}_predictions.csv"
+            save_anonymized_details(csv_path, records[level], args.threshold, args.id_salt)
+            print("Saved local pseudonymous predictions:", csv_path)
+        print("WARNING: Do not commit prediction CSVs to a public repository without authorization.")
+
+
+if __name__ == "__main__":
+    main()
