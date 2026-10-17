@@ -11,6 +11,7 @@ Examples:
 """
 
 import argparse
+import copy
 import hashlib
 import json
 import math
@@ -24,12 +25,12 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 
-from dataset import load_datasets, load_patient_map, transform, MRIAugmentedTrainingSet
+from dataset import (load_datasets, load_patient_map, get_transform,
+                     MRIAugmentedTrainingSet, SPLIT_MODES, INPUT_MODES)
 from predict import (create_records, evaluate, get_sample_info,
                      patient_mapping_fingerprint)
 from baseline import SimpleCNN
 from modules import ConvNeXt
-from mri_intensity import intensity_protocol, make_training_input
 
 # Signal handlers ask the training loop to save after the current optimizer step.
 _STOP_REQUESTED = False
@@ -185,7 +186,27 @@ def check_class_mapping(train_dataset, val_dataset, test_dataset):
     print("Verified class mapping: AD=0, NC=1")
 
 
-def make_training_loader(dataset, epoch, seed, batch_size, start_batch, limit):
+def learning_rate_at(step, total_steps, base_lr, warmup_steps):
+    """Linear warmup, then cosine decay to zero; depends only on the step,
+    so an interrupted run resumes on exactly the same schedule."""
+    if warmup_steps and step < warmup_steps:
+        return base_lr * (step + 1) / warmup_steps
+    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+    return base_lr * 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+
+
+@torch.no_grad()
+def update_ema(ema_model, model, decay, step):
+    """Exponential moving average of weights; short warmup avoids early bias."""
+    d = min(decay, (1.0 + step) / (10.0 + step))
+    for ema_p, p in zip(ema_model.parameters(), model.parameters()):
+        ema_p.mul_(d).add_(p.detach(), alpha=1.0 - d)
+    for ema_b, b in zip(ema_model.buffers(), model.buffers()):
+        ema_b.copy_(b)
+
+
+def make_training_loader(dataset, epoch, seed, batch_size, start_batch, limit,
+                         num_workers=0):
     # Every epoch's order is reproducible, even after an interrupted run.
     generator = torch.Generator().manual_seed(seed + epoch)
     permutation = torch.randperm(len(dataset), generator=generator).tolist()
@@ -200,7 +221,7 @@ def make_training_loader(dataset, epoch, seed, batch_size, start_batch, limit):
     loader_generator = torch.Generator().manual_seed(seed + epoch + 1000000)
     loader = DataLoader(
         dataset, batch_size=batch_size, sampler=remaining_indices,
-        num_workers=0, generator=loader_generator
+        num_workers=num_workers, generator=loader_generator
     )
     return loader, total_batches
 
@@ -210,7 +231,8 @@ def make_training_loader(dataset, epoch, seed, batch_size, start_batch, limit):
 
 
 def save_progress(output_dir, model, optimizer, args, fingerprint, epoch,
-                  next_batch, loss_sum, seen_samples, history, best_score):
+                  next_batch, loss_sum, seen_samples, history, best_score,
+                  ema_model=None):
     checkpoint = {
         "version": 2,
         "model_name": args.model,
@@ -219,11 +241,17 @@ def save_progress(output_dir, model, optimizer, args, fingerprint, epoch,
         "optimizer_name": args.optimizer,
         "weight_decay": args.weight_decay,
         "training_augmentation": args.augment,
-        "intensity_augmentation": intensity_protocol(args.intensity_augment),
         "seed": args.seed,
         "max_train_batches": args.max_train_batches,
         "max_val_batches": args.max_val_batches,
         "split_fingerprint": fingerprint,
+        "split_mode": args.split_mode,
+        "input_mode": args.input_mode,
+        "scheduler": args.scheduler,
+        "warmup_epochs": args.warmup_epochs,
+        "ema_decay": args.ema_decay,
+        "label_smoothing": args.label_smoothing,
+        "target_epochs": args.epochs,
         "selection_level": args.selection_level,
         "selection_threshold": args.selection_threshold,
         "epoch": epoch,                  # zero-indexed, next epoch/batch to run
@@ -233,6 +261,7 @@ def save_progress(output_dir, model, optimizer, args, fingerprint, epoch,
         "best_score": best_score,
         "history": history,
         "model_state": model.state_dict(),
+        "ema_state": ema_model.state_dict() if ema_model is not None else None,
         "optimizer_state": optimizer.state_dict(),
         "torch_rng_state": torch.get_rng_state(),
         "python_rng_state": random.getstate(),
@@ -244,7 +273,7 @@ def save_progress(output_dir, model, optimizer, args, fingerprint, epoch,
 @torch.no_grad()
 def validate(model, loader, criterion, device, max_batches=None,
              samples=None, patient_map=None, selection_level="slice",
-             selection_threshold=0.5):
+             selection_threshold=0.5, allow_mixed_patients=False):
     """Score every available validation slice and, when complete, scans/patients.
 
     All checkpoints are selected using the same metric and threshold that
@@ -280,7 +309,11 @@ def validate(model, loader, criterion, device, max_batches=None,
             raise RuntimeError("Validation order/labels changed between DataLoader and ImageFolder")
         records = create_records(samples, probabilities_ad, patient_map)
         if records["excluded_mixed_label_patients"]:
-            raise ValueError("Mixed-label patients detected; review data before model selection")
+            if not allow_mixed_patients or selection_level == "patient":
+                raise ValueError("Mixed-label patients detected; review data before model selection")
+            # Official split only: such subjects still count at slice/scan level.
+            print(f"WARNING: {records['excluded_mixed_label_patients']} validation subjects have "
+                  "mixed AD/NC labels and are left out of patient-level metrics.", flush=True)
         for level in ("slice", "scan", "patient"):
             score = evaluate(records[level], selection_threshold)
             if score is not None:
@@ -313,6 +346,19 @@ def main():
     parser.add_argument("--confirm-final-test", action="store_true",
                         help="Acknowledge official test should not be used for tuning")
     parser.add_argument("--model", choices=["cnn", "convnext"], default="cnn")
+    parser.add_argument("--split-mode", choices=list(SPLIT_MODES), default="strict",
+                        help="strict: remove subjects shared with official test (default); "
+                             "official: use the course train/test folders as provided")
+    parser.add_argument("--input-mode", choices=list(INPUT_MODES), default="single",
+                        help="single: one slice copied to 3 channels; "
+                             "context3: previous/current/next slice of the same scan")
+    parser.add_argument("--scheduler", choices=["none", "cosine"], default="none",
+                        help="cosine: linear warmup then per-step cosine decay")
+    parser.add_argument("--warmup-epochs", type=float, default=1.0)
+    parser.add_argument("--ema-decay", type=float, default=0.0,
+                        help="0 disables; e.g. 0.999 validates/saves EMA weights")
+    parser.add_argument("--label-smoothing", type=float, default=0.0)
+    parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=3,
                         help="Total target epochs, not additional epochs on resume")
     parser.add_argument("--batch-size", type=int, default=8)
@@ -321,8 +367,6 @@ def main():
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--augment", action="store_true",
                         help="Enable mild geometric/noise augmentation on TRAIN only")
-    parser.add_argument("--intensity-augment", action="store_true",
-                        help="TRAIN only: fixed scale/Gamma 0.9-1.1 before original augmentation")
     parser.add_argument("--selection-level", choices=["slice", "scan", "patient"],
                         default="slice", help="Level used to choose best.pth on validation")
     parser.add_argument("--selection-threshold", type=float, default=0.5,
@@ -353,8 +397,6 @@ def main():
         subprocess.run(cmd, check=True)
         return
 
-    if args.intensity_augment and (not args.augment or args.model != "convnext"):
-        parser.error("--intensity-augment requires --model convnext --augment")
     if not (0 < args.selection_threshold < 1):
         parser.error("--selection-threshold must be between 0 and 1")
     if args.selection_level != "slice" and args.max_val_batches is not None:
@@ -363,6 +405,12 @@ def main():
         parser.error("epochs, batch-size, save-every-batches must be positive")
     if args.learning_rate <= 0:
         parser.error("learning-rate must be positive")
+    if not 0.0 <= args.ema_decay < 1.0:
+        parser.error("ema-decay must be in [0, 1)")
+    if not 0.0 <= args.label_smoothing < 0.5:
+        parser.error("label-smoothing must be in [0, 0.5)")
+    if args.warmup_epochs < 0 or args.num_workers < 0:
+        parser.error("warmup-epochs and num-workers cannot be negative")
     if args.weight_decay < 0:
         parser.error("weight-decay cannot be negative")
     if any(v is not None and v <= 0 for v in
@@ -389,7 +437,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device, flush=True)
 
-    train_dataset, val_dataset, test_dataset = load_datasets()
+    train_dataset, val_dataset, test_dataset = load_datasets(args.split_mode, args.input_mode)
+    transform = get_transform(args.input_mode)
     check_class_mapping(train_dataset, val_dataset, test_dataset)
     print("Training images:", len(train_dataset))
     print("Validation images:", len(val_dataset))
@@ -407,10 +456,15 @@ def main():
     val_patient_map = patient_map_all if val_samples is not None else None
     val_loader = DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=0, generator=torch.Generator().manual_seed(args.seed + 2000000)
+        num_workers=args.num_workers, generator=torch.Generator().manual_seed(args.seed + 2000000)
     )
     model = SimpleCNN() if args.model == "cnn" else ConvNeXt(num_classes=2, in_channels=3)
     model = model.to(device)
+    ema_model = None
+    if args.ema_decay > 0:
+        ema_model = copy.deepcopy(model)
+        for parameter in ema_model.parameters():
+            parameter.requires_grad_(False)
     if args.optimizer == "adamw":
         optimizer = torch.optim.AdamW(
             model.parameters(), lr=args.learning_rate,
@@ -423,9 +477,12 @@ def main():
         )
     print("Optimizer:", args.optimizer, "weight decay:", args.weight_decay)
     print("Train-only augmentation:", args.augment)
-    print("Train-only intensity protocol:", intensity_protocol(args.intensity_augment))
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+    val_criterion = nn.CrossEntropyLoss()  # plain CE keeps val loss comparable across runs
     print("Selected model:", args.model)
+    print(f"Input mode: {args.input_mode}; scheduler: {args.scheduler} "
+          f"(warmup {args.warmup_epochs} epochs); EMA decay: {args.ema_decay}; "
+          f"label smoothing: {args.label_smoothing}")
     print("Trainable parameters:", sum(p.numel() for p in model.parameters() if p.requires_grad))
 
     if args.resume:
@@ -440,10 +497,15 @@ def main():
             "learning_rate": args.learning_rate, "seed": args.seed,
             "optimizer_name": args.optimizer, "weight_decay": args.weight_decay,
             "training_augmentation": args.augment,
-            "intensity_augmentation": intensity_protocol(args.intensity_augment),
             "max_train_batches": args.max_train_batches,
             "max_val_batches": args.max_val_batches,
             "split_fingerprint": fingerprint,
+            "split_mode": args.split_mode,
+            "input_mode": args.input_mode,
+            "scheduler": args.scheduler,
+            "warmup_epochs": args.warmup_epochs,
+            "ema_decay": args.ema_decay,
+            "label_smoothing": args.label_smoothing,
             "selection_level": args.selection_level,
             "selection_threshold": args.selection_threshold,
         }.items():
@@ -453,10 +515,23 @@ def main():
                 "training_augmentation": False,
                 "selection_level": "slice",
                 "selection_threshold": 0.5,
+                "split_mode": "strict",
+                "input_mode": "single",
+                "scheduler": "none",
+                "warmup_epochs": 1.0,
+                "ema_decay": 0.0,
+                "label_smoothing": 0.0,
             }.get(key))
             if previous != current:
                 raise ValueError(f"Resume mismatch for {key}: saved={checkpoint.get(key)}, now={current}")
+        if args.scheduler == "cosine" and checkpoint.get("target_epochs") != args.epochs:
+            raise ValueError("A cosine schedule depends on --epochs; resume with the "
+                             f"original value {checkpoint.get('target_epochs')}")
         model.load_state_dict(checkpoint["model_state"])
+        if ema_model is not None:
+            if checkpoint.get("ema_state") is None:
+                raise ValueError("Checkpoint has no EMA weights")
+            ema_model.load_state_dict(checkpoint["ema_state"])
         optimizer.load_state_dict(checkpoint["optimizer_state"])
         start_epoch = checkpoint["epoch"]
         start_batch = checkpoint["next_batch"]
@@ -486,7 +561,6 @@ def main():
             "optimizer_name": args.optimizer,
             "weight_decay": args.weight_decay,
             "training_augmentation": args.augment,
-            "intensity_augmentation": intensity_protocol(args.intensity_augment),
             "target_epochs": args.epochs,
             "train_images": len(train_dataset), "val_images": len(val_dataset),
             "test_images": len(test_dataset),
@@ -496,11 +570,18 @@ def main():
             "selection_level": args.selection_level,
             "selection_threshold": args.selection_threshold,
             "preprocessing_repr": repr(transform),
+            "split_mode": args.split_mode,
+            "input_mode": args.input_mode,
+            "scheduler": args.scheduler,
+            "warmup_epochs": args.warmup_epochs,
+            "ema_decay": args.ema_decay,
+            "label_smoothing": args.label_smoothing,
+            "num_workers": args.num_workers,
             "split_fingerprint": fingerprint,
             "smoke_test": is_smoke_test,
         })
         save_progress(output_dir, model, optimizer, args, fingerprint,
-                      0, 0, 0.0, 0, history, best_score)
+                      0, 0, 0.0, 0, history, best_score, ema_model)
 
     if args.epochs < start_epoch or (args.epochs == start_epoch and start_batch):
         raise ValueError("--epochs must be larger than the saved progress")
@@ -512,14 +593,23 @@ def main():
         signal.signal(signal.SIGUSR1, request_stop)
 
     print("Outputs:", output_dir, flush=True)
+    print("Split mode:", args.split_mode, flush=True)
     print(f"Best model: {args.selection_level} macro-F1 at AD threshold "
           f"{args.selection_threshold:.2f} (tie: AD recall, then validation loss)", flush=True)
     print("Checkpoint every", args.save_every_batches, "training batches", flush=True)
 
     # Keep the original dataset unchanged for patient-level split auditing,
     # fingerprinting, and validation. Augmentation wraps only training images.
-    training_input = make_training_input(train_dataset, args.augment,
-                                         args.intensity_augment, MRIAugmentedTrainingSet)
+    training_input = (
+        MRIAugmentedTrainingSet(train_dataset)
+        if args.augment else train_dataset
+    )
+    samples_per_epoch = len(training_input)
+    if args.max_train_batches is not None:
+        samples_per_epoch = min(samples_per_epoch, args.max_train_batches * args.batch_size)
+    steps_per_epoch = math.ceil(samples_per_epoch / args.batch_size)
+    total_steps = steps_per_epoch * args.epochs
+    warmup_steps = int(round(args.warmup_epochs * steps_per_epoch))
 
     for epoch in range(start_epoch, args.epochs):
         model.train()
@@ -528,12 +618,18 @@ def main():
             loss_sum, seen_samples = 0.0, 0
         loader, total_batches = make_training_loader(
             training_input, epoch, args.seed, args.batch_size,
-            batch_offset, args.max_train_batches
+            batch_offset, args.max_train_batches, args.num_workers
         )
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         for local_index, (images, labels) in enumerate(loader):
             next_batch = batch_offset + local_index + 1
+            global_step = epoch * steps_per_epoch + next_batch - 1
+            if args.scheduler == "cosine":
+                current_lr = learning_rate_at(global_step, total_steps,
+                                              args.learning_rate, warmup_steps)
+                for group in optimizer.param_groups:
+                    group["lr"] = current_lr
             images = images.to(device)
             labels = labels.to(device)
             optimizer.zero_grad(set_to_none=True)
@@ -541,6 +637,8 @@ def main():
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
+            if ema_model is not None:
+                update_ema(ema_model, model, args.ema_decay, global_step)
 
             n = labels.size(0)
             loss_sum += loss.item() * n
@@ -550,7 +648,7 @@ def main():
                     next_batch == total_batches or _STOP_REQUESTED):
                 save_progress(output_dir, model, optimizer, args, fingerprint,
                               epoch, next_batch, loss_sum, seen_samples,
-                              history, best_score)
+                              history, best_score, ema_model)
                 print(f"Epoch {epoch + 1}/{args.epochs}: "
                       f"batch {next_batch}/{total_batches}, "
                       f"train loss {loss_sum / seen_samples:.4f}; checkpoint saved",
@@ -564,18 +662,19 @@ def main():
         if seen_samples == 0:
             raise ValueError("Empty training epoch")
         train_loss = loss_sum / seen_samples
-        metrics = validate(model, val_loader, criterion, device, args.max_val_batches,
+        eval_model = ema_model if ema_model is not None else model
+        metrics = validate(eval_model, val_loader, val_criterion, device, args.max_val_batches,
                            samples=val_samples, patient_map=val_patient_map,
                            selection_level=args.selection_level,
-                           selection_threshold=args.selection_threshold)
+                           selection_threshold=args.selection_threshold,
+                           allow_mixed_patients=(args.split_mode == "official"))
         candidate = (metrics["selection_macro_f1"],
                      metrics["selection_recall_ad"], -metrics["val_loss"])
         if candidate > best_score:
             best_score = candidate
-            save_checkpoint_atomic(output_dir / "best.pth", model.state_dict())
+            save_checkpoint_atomic(output_dir / "best.pth", eval_model.state_dict())
             save_json_atomic(output_dir / "best_meta.json", {
                 "model": args.model,
-                "intensity_augmentation": intensity_protocol(args.intensity_augment),
                 "checkpoint_format": "raw_state_dict_v1",
                 "best_epoch": epoch + 1,
                 "selection_level": args.selection_level,
@@ -583,6 +682,11 @@ def main():
                 "selection_macro_f1": metrics["selection_macro_f1"],
                 "selection_recall_ad": metrics["selection_recall_ad"],
                 "selection_accuracy": metrics["selection_accuracy"],
+                "split_mode": args.split_mode,
+                "input_mode": args.input_mode,
+                "weights": "ema" if ema_model is not None else "raw",
+                "scheduler": args.scheduler,
+                "label_smoothing": args.label_smoothing,
                 "split_fingerprint": fingerprint,
                 "patient_mapping_fingerprint": patient_fingerprint,
                 "preprocessing_repr": repr(transform),
@@ -592,7 +696,8 @@ def main():
             print("Best model updated using validation "
                   f"{args.selection_level} macro-F1 at {args.selection_threshold:.2f}.", flush=True)
 
-        record = {"epoch": epoch + 1, "train_loss": train_loss, **metrics}
+        record = {"epoch": epoch + 1, "train_loss": train_loss,
+                  "learning_rate": optimizer.param_groups[0]["lr"], **metrics}
         if device.type == "cuda":
             record["peak_gpu_memory_mb"] = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
         history.append(record)
@@ -602,7 +707,7 @@ def main():
         # The next checkpoint starts at the beginning of the following epoch.
         # The saved state includes Adam's momentum/variance estimates and RNG.
         save_progress(output_dir, model, optimizer, args, fingerprint,
-                      epoch + 1, 0, 0.0, 0, history, best_score)
+                      epoch + 1, 0, 0.0, 0, history, best_score, ema_model)
         print(f"\nEpoch {epoch + 1}/{args.epochs} completed: "
               f"loss={train_loss:.4f}, val_acc={metrics['accuracy']:.4f}, "
               f"macro_F1={metrics['macro_f1']:.4f}, "
