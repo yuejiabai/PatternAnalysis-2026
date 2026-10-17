@@ -26,6 +26,14 @@ Course dataset: `/home/groups/comp3710/ADNI/AD_NC`; metadata: `/home/groups/comp
 
 Input preprocessing: resize to 224×224, convert to grayscale and replicate into 3 channels, convert to tensor, and normalize with mean/std = 0.5. For the augmented ConvNeXt experiment, *training only* additionally applies slight affine transforms and Gaussian noise; validation/test images do not receive augmentations.
 
+### Split modes (strict vs official)
+
+`--split-mode strict` (default) removes every ADNI subject that also has a scan in the official test folder, so the test estimate is subject-independent. `--split-mode official` keeps the course train/test folders exactly as provided. Course staff describe these folders as leak-free; however, the filename prefix is the ADNI **Image ID** of one scan, not the subject, and mapping prefixes to subject IDs through the metadata shows 216 subjects with different visits in both folders. In both modes, validation is split by **subject**. Official-mode test accuracy is reported separately and is **not** a subject-independent estimate.
+
+### Training recipe and input options (official split, validation-selected)
+
+`run_recipe.slurm` trains for 30 epochs with a 1-epoch linear warmup and per-step cosine decay, an exponential moving average (EMA, decay 0.999) of the weights (the EMA weights are validated and saved), and label smoothing 0.1. `--input-mode context3` feeds the previous, current and next slice of the same scan as the three input channels (2.5D); edge slices repeat themselves. Each sample is still one slice with one label, so accuracy remains per slice. Variants are compared on **validation only**; the official test is run once for the variant chosen in advance. `predict.py` accepts several `--checkpoint` files and averages their AD probabilities (seed ensemble); for an official-split test it also reports accuracy separately for test subjects with and without other scans in the course train folder.
+
 ## 3. Setup and reproducibility
 
 Developed on Rangpur using Python with PyTorch `2.0.1+cu117` and torchvision `0.15.2+cu117`, P100 GPU (16 GB), with a separate `torch117` conda environment. Install compatible `matplotlib` for plots. **Do not install a newer CUDA-dependent PyTorch build over the working environment without checking P100 compatibility.** Other exact installed package versions must be recorded from the environment before the final submission.
