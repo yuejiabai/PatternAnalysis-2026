@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.env
+checkpoints/
+smoke_outputs/
+evaluation_results/
+evaluation_results_balanced/
+results/
+diagnostics/
+*.pth
+*.pt
+*.nii
+*.nii.gz
+*.jpeg
+*.jpg
+# Medical images are never committed; approved self-made report charts may be committed under docs/figures.
+# Keep only intentionally selected, approved figures in docs/figures if allowed.
