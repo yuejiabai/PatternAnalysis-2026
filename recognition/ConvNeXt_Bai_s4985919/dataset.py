@@ -6,6 +6,9 @@ from pathlib import Path
 from collections import defaultdict, Counter
 
 from torchvision import datasets, transforms
+from torchvision.transforms import RandomAffine, InterpolationMode
+from torch.utils.data import Dataset
+import torch
 from torch.utils.data import Subset
 
 
@@ -168,6 +171,34 @@ def load_datasets():
     print("Patient-level split verified.")
 
     return train_dataset, val_dataset, test_dataset
+
+
+
+class MRIAugmentedTrainingSet(Dataset):
+    """Mild per-slice augmentation applied to TRAIN only.
+
+    Uses inputs already normalised to [-1, 1] by dataset.py; fill=-1
+    corresponds to black outside the MRI when normalisation is (x-.5)/.5.
+    Avoid left-right flips: they can distort clinically meaningful anatomy.
+    """
+    def __init__(self, original):
+        self.original = original
+        self.affine = RandomAffine(
+            degrees=6,
+            translate=(0.03, 0.03),
+            scale=(0.97, 1.03),
+            interpolation=InterpolationMode.BILINEAR,
+            fill=-1.0,
+        )
+
+    def __len__(self):
+        return len(self.original)
+
+    def __getitem__(self, index):
+        image, label = self.original[index]
+        image = self.affine(image)
+        image = (image + torch.randn_like(image) * 0.01).clamp(-1.0, 1.0)
+        return image, label
 
 
 if __name__ == "__main__":
