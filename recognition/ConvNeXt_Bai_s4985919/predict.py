@@ -29,10 +29,10 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from dataset import get_image_id, load_datasets, load_patient_map
+from dataset import (get_image_id, load_datasets, load_patient_map, get_transform,
+                     SPLIT_MODES, INPUT_MODES)
 from modules import ConvNeXt
 from baseline import SimpleCNN
-from dataset import transform
 
 
 DEFAULT_CHECKPOINT = Path(
@@ -84,7 +84,7 @@ def check_checkpoint_compatibility(metadata, args, train_ds, val_ds, test_ds, pa
                          f"{metadata.get('model')!r}, requested {args.model!r}")
     if metadata.get("class_to_idx") != {"AD": 0, "NC": 1}:
         raise ValueError("Class mapping mismatch in checkpoint metadata")
-    if metadata.get("preprocessing_repr") != repr(transform):
+    if metadata.get("preprocessing_repr") != repr(get_transform(args.input_mode)):
         raise ValueError("Preprocessing mismatch between trained model and dataset.py")
     expected = metadata.get("split_fingerprint")
     if not isinstance(expected, dict) or set(expected) != {"train", "validation", "test"}:
@@ -287,11 +287,18 @@ def save_anonymized_details(path, records, threshold, salt):
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--split", choices=["validation", "test"], default="validation")
-    p.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
+    p.add_argument("--checkpoint", type=Path, nargs="+", default=[DEFAULT_CHECKPOINT],
+                   help="One best.pth, or several to average their AD probabilities "
+                        "(ensemble); all must share split mode, input mode and threshold")
     p.add_argument("--model", choices=["convnext", "cnn"], default="convnext",
                    help="Architecture to load; explicit for legacy checkpoints")
     p.add_argument("--threshold", type=float, default=None,
                    help="AD cutoff; default uses saved best_meta.json, else 0.50")
+    p.add_argument("--split-mode", choices=list(SPLIT_MODES), default=None,
+                   help="Must match training; default comes from best_meta.json, else strict")
+    p.add_argument("--input-mode", choices=list(INPUT_MODES), default=None,
+                   help="Must match training; default comes from best_meta.json, else single")
+    p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--output-dir", type=Path, default=Path("evaluation_results"))
     p.add_argument("--confirm-final-test", action="store_true",
@@ -307,8 +314,11 @@ def parse_args():
         p.error("Batch size must be >= 1")
     if args.split == "test" and not args.confirm_final_test:
         p.error("Official test evaluation requires --confirm-final-test")
-    if not args.checkpoint.is_file():
-        p.error(f"Checkpoint not found: {args.checkpoint}")
+    for checkpoint in args.checkpoint:
+        if not checkpoint.is_file():
+            p.error(f"Checkpoint not found: {checkpoint}")
+    if len(set(args.checkpoint)) != len(args.checkpoint):
+        p.error("The same checkpoint was listed twice")
     return args
 
 
@@ -316,8 +326,16 @@ def main():
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
-    print(f"Split: {args.split.upper()}, checkpoint: {args.checkpoint}")
-    metadata = load_best_metadata(args.checkpoint)
+    print(f"Split: {args.split.upper()}, checkpoint(s): "
+          + ", ".join(str(c) for c in args.checkpoint))
+    all_metadata = [load_best_metadata(c) for c in args.checkpoint]
+    metadata = all_metadata[0]
+    if len(args.checkpoint) > 1:
+        if any(m is None for m in all_metadata):
+            raise ValueError("Ensembles require best_meta.json for every checkpoint")
+        for key in ("split_mode", "input_mode", "selection_threshold", "model"):
+            if len({str(m.get(key)) for m in all_metadata}) != 1:
+                raise ValueError(f"Ensemble members disagree on {key}")
     if args.threshold is None:
         args.threshold = (metadata.get("selection_threshold", 0.5)
                           if metadata is not None else 0.5)
@@ -326,24 +344,44 @@ def main():
         print("WARNING: Manual threshold override. Document validation-only rationale; "
               "NEVER select a threshold based on test metrics.")
     print(f"Frozen primary AD threshold: {args.threshold:.2f}")
-    print("Preprocessing: dataset.py resize(224,224), grayscale-to-3, normalize(0.5)")
+    saved_mode = metadata.get("split_mode", "strict") if metadata is not None else None
+    if args.split_mode is None:
+        args.split_mode = saved_mode or "strict"
+    elif saved_mode is not None and args.split_mode != saved_mode:
+        raise ValueError(f"--split-mode {args.split_mode} does not match training split "
+                         f"mode {saved_mode} in best_meta.json")
+    print("Split mode:", args.split_mode)
+    saved_input = metadata.get("input_mode", "single") if metadata is not None else None
+    if args.input_mode is None:
+        args.input_mode = saved_input or "single"
+    elif saved_input is not None and args.input_mode != saved_input:
+        raise ValueError(f"--input-mode {args.input_mode} does not match training "
+                         f"input mode {saved_input} in best_meta.json")
+    print("Input mode:", args.input_mode)
+    print("Preprocessing:", repr(get_transform(args.input_mode)).replace("\n", " "))
 
-    train_ds, val_ds, test_ds = load_datasets()
+    train_ds, val_ds, test_ds = load_datasets(args.split_mode, args.input_mode)
     patient_map = load_patient_map()
-    check_checkpoint_compatibility(metadata, args, train_ds, val_ds, test_ds, patient_map)
+    for member_metadata in all_metadata:
+        check_checkpoint_compatibility(member_metadata, args, train_ds, val_ds,
+                                       test_ds, patient_map)
     ds = val_ds if args.split == "validation" else test_ds
     samples = get_sample_info(ds)
 
-    model = (ConvNeXt(num_classes=2, in_channels=3)
-             if args.model == "convnext" else SimpleCNN()).to(device)
-    # The project's best.pth saves the raw state_dict (NOT the resume dict).
-    state = torch.load(args.checkpoint, map_location=device)
-    if not isinstance(state, dict) or "model_state" in state:
-        raise ValueError("Expected best.pth model weights, not last.pth resume checkpoint")
-    model.load_state_dict(state, strict=True)
-    model.eval()
+    models = []
+    for checkpoint in args.checkpoint:
+        model = (ConvNeXt(num_classes=2, in_channels=3)
+                 if args.model == "convnext" else SimpleCNN()).to(device)
+        # The project's best.pth saves the raw state_dict (NOT the resume dict).
+        state = torch.load(checkpoint, map_location=device)
+        if not isinstance(state, dict) or "model_state" in state:
+            raise ValueError("Expected best.pth model weights, not last.pth resume checkpoint")
+        model.load_state_dict(state, strict=True)
+        model.eval()
+        models.append(model)
 
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False,
+                        num_workers=args.num_workers)
     labels_seen, scores = [], []
     total_time = 0.0
     with torch.inference_mode():
@@ -352,8 +390,10 @@ def main():
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             start = time.perf_counter()
-            outputs = model(images)
-            probabilities = torch.softmax(outputs, dim=1)[:, 0]
+            # Ensemble = mean of member AD probabilities (one member: unchanged).
+            probabilities = torch.stack([
+                torch.softmax(member(images), dim=1)[:, 0] for member in models
+            ]).mean(dim=0)
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             total_time += time.perf_counter() - start
@@ -377,6 +417,27 @@ def main():
         result_by_level[level] = metrics
         print_metrics(level, metrics)
 
+    overlap_summary = None
+    if args.split == "test" and args.split_mode == "official":
+        # Leakage diagnosis: test subjects that also have (other) scans in the
+        # training/validation folders versus subjects the model never saw.
+        seen_subjects = {patient_map[get_image_id(path)]
+                         for dataset in (train_ds, val_ds)
+                         for path, _ in get_sample_info(dataset)}
+        overlap_summary = {}
+        print("Official-split test, stratified by whether the subject has other "
+              "scans in the course train folder:")
+        for name, keep in (("seen_subjects", True), ("unseen_subjects", False)):
+            subset = [record for record in records["slice"]
+                      if (patient_map[get_image_id(record[0])] in seen_subjects) == keep]
+            subjects = {patient_map[get_image_id(record[0])] for record in subset}
+            result = evaluate(subset, args.threshold)
+            if result is not None:
+                result["n_subjects"] = len(subjects)
+            overlap_summary[name] = result
+            print(f"  {name} ({len(subjects)} subjects):")
+            print_metrics("slice", result)
+
     print(f"Forward-pass latency: {1000 * total_time / max(len(scores), 1):.3f} ms/slice "
           f"(batch-size={args.batch_size}; excludes file loading & transfer)")
     print("NOTE: Scan- and patient-level scores are separate outcomes, NOT slice accuracy.")
@@ -386,11 +447,16 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
     summary = {
         "split": args.split,
+        "split_mode": args.split_mode,
+        "subject_independent_test": args.split_mode == "strict",
         "model": args.model,
         "checkpoint_metadata_verified": metadata is not None,
         "selection_level": metadata.get("selection_level") if metadata else "unknown_legacy",
         "selection_threshold": metadata.get("selection_threshold") if metadata else None,
-        "checkpoint": args.checkpoint.as_posix(),
+        "checkpoint": [c.as_posix() for c in args.checkpoint],
+        "input_mode": args.input_mode,
+        "ensemble_size": len(args.checkpoint),
+        "official_test_by_subject_overlap": overlap_summary,
         "threshold_ad": args.threshold,
         "selection": "New best_meta.json verifies saved selection; legacy files are unverified",
         "class_map": {"AD": 0, "NC": 1},
