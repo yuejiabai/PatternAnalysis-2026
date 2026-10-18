@@ -291,11 +291,21 @@ Datasets, checkpoints, logs, raw scan IDs and MRI montages are not committed (`.
 
 ## 13. Artificial Intelligence Usage Disclosure
 
-**[TODO: check every sentence against what you actually did.]**
+**My own work.** I wrote the ConvNeXt architecture in `modules.py` and the original data loading in `dataset.py`. I chose the project, planned and ran every experiment on Rangpur (all 13 training runs and all evaluations), decided which results to keep and how to report them, and raised the train/test subject overlap with the teaching team on Ed.
 
-- **Tools:** ChatGPT, OpenAI Codex and Anthropic Claude (Claude Code).
-- **Tasks they assisted with:** refactoring the data split, training and evaluation code; the split-mode, context-input, EMA/cosine and ensemble options; the analysis script (calibration, reject rule, subgroup analysis); unit tests; debugging Rangpur and Slurm jobs; reviewing results for leakage; and drafting and editing this README.
-- **How I verified the output:** I ran all training and evaluation myself on Rangpur and checked every number in this README against job logs and the saved `analysis.json`; subject-level separation is asserted in code; checkpoints carry split and preprocessing fingerprints that `predict.py` and `analyze.py` check before use; unit tests on synthetic data pass on Rangpur; AI suggestions that were wrong (for example an over-simplified reading of the unseen-subject result and an ensemble latency mislabelled as single-model) were found by checking against the data and corrected.
+**Tools used.** ChatGPT, OpenAI Codex and Anthropic Claude (Claude Code). No other AI tools.
+
+**What the tools helped with.**
+- Code review of my scripts, and help extending them: the strict/official split option, the 3-slice input, the cosine schedule, EMA and the ensemble option in `train.py`/`predict.py`, and the analysis script `analyze.py`.
+- Writing unit tests and helper scripts (`collect_runs.py`).
+- Debugging Rangpur and Slurm problems.
+- Explaining concepts (calibration, reject option) and helping me phrase and structure this README.
+
+**How I checked the output.**
+- Every number in this README comes from logs produced by my own runs, which are committed in `run_logs/`; I compared them against the job outputs.
+- Subject-level separation is asserted in the code, and saved checkpoints carry split and preprocessing fingerprints that are checked before inference.
+- The unit tests on synthetic data were run on Rangpur and pass.
+- Some AI suggestions were wrong and were corrected after checking them against the logs, for example an over-simplified reading of the unseen-subject result and an ensemble latency first reported as a single-model latency.
 
 ## References
 
