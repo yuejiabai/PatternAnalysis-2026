@@ -82,7 +82,9 @@ Caveats:
 
 ## 6. Open dilemma: confidence, calibration and a reject option
 
-**Does confidence track correctness?** Partly. ConvNeXt's mean confidence is 0.888 on correct and 0.811 on wrong test slices, and accepted-slice accuracy rises as fewer slices are accepted (coverage curve). But it is over-confident everywhere (reliability curve below the diagonal, test ECE 0.118), and **959 of its 2,222 test errors have confidence ≥ 0.9**. The CNN is better calibrated (ECE 0.028, Brier 0.218 vs 0.186) mainly because it is rarely confident (mean confidence 0.691 correct vs 0.651 wrong), so its confidence barely separates right from wrong.
+**Does confidence track correctness?** Partly. ConvNeXt's mean confidence is 0.888 on correct and 0.811 on wrong test slices, and accepted-slice accuracy rises as fewer slices are accepted (coverage curve). But it is over-confident everywhere (reliability curve below the diagonal, test ECE 0.118), and **959 of its 2,222 test errors have confidence ≥ 0.9**. The CNN has a lower average calibration error (ECE 0.028; Brier 0.218 vs 0.186) mainly because it is rarely confident (mean confidence 0.691 correct vs 0.651 wrong), so its confidence barely separates right from wrong. Worse, its *few* very confident test predictions are mostly wrong: in its reliability diagram, test slices with confidence above about 0.95 are correct far less than half the time, and its accepted-slice accuracy on test collapses at low coverage. A low average ECE therefore hides the most dangerous errors.
+
+![Reliability diagram, SimpleCNN](figures/cnn_reliability.png)
 
 ![Reliability diagram, ConvNeXt](figures/convnext_reliability.png)
 ![Accuracy vs coverage, ConvNeXt](figures/convnext_coverage_accuracy.png)
@@ -155,7 +157,11 @@ Inference timing covers the GPU forward pass only (no JPEG decoding or loading) 
 
 ## 9. Experiment history
 
-All runs, read from each run's `config.json`, `history.json` and `best_meta.json` on Rangpur. "Best val acc" is the highest validation slice accuracy at AD threshold 0.5 over all epochs (slightly optimistic, because it is a maximum); "saved" is the validation accuracy of the checkpoint actually kept by the selection rule (validation macro-F1), where the run recorded it. Strict and official runs use **different validation subjects** (70 vs 113), so accuracies are only comparable within the same split.
+All runs, read from each run's `config.json`, `history.json` and `best_meta.json`. These files are written automatically by `train.py` and are committed unchanged in [`run_logs/`](run_logs/) (with `run_logs/summary.csv`), so every number below can be checked against the original logs; `collect_runs.py` gathers them and draws the figure.
+
+![Validation accuracy per epoch for all 13 runs](figures/experiment_history.png)
+
+ "Best val acc" is the highest validation slice accuracy at AD threshold 0.5 over all epochs (slightly optimistic, because it is a maximum); "saved" is the validation accuracy of the checkpoint actually kept by the selection rule (validation macro-F1), where the run recorded it. Strict and official runs use **different validation subjects** (70 vs 113), so accuracies are only comparable within the same split.
 
 | # | Run | Split | Change tested | Epochs | Best val acc (epoch) | Saved checkpoint | Verdict |
 |---|---|---|---|---|---|---|---|
@@ -265,6 +271,9 @@ Reject rule (chosen on validation for 90% accepted accuracy): confidence >= 0.92
 | `test_brightness_sensitivity.py` | Validation-only brightness sensitivity experiment (a script, not a unit test) |
 | `test_*.py` (others) | Unit tests on synthetic data |
 | `run_recipe.slurm`, `run_official_split.slurm` | Slurm jobs for the final recipe and the official split |
+| `collect_runs.py` | Copies every run's config/history/selection logs into `run_logs/` and draws `figures/experiment_history.png` |
+| `run_logs/` | Original training logs of all 13 runs (settings and per-epoch validation metrics only) |
+| `run_logs/evaluation/` | Original `analyze.py` outputs (`analysis_convnext_ensemble.json`, `analysis_cnn.json`): every validation/test number, reject-rule, subgroup, failure-case and resource figure in Sections 2 and 5–8; plus the `predict.py` metric files of earlier evaluations (named `<project>__<output folder>__<file>.json`, e.g. the strict-split test run of Section 9). No scan or subject IDs |
 | `figures/` | Plots used in this README (no MRI images) |
 
 Datasets, checkpoints, logs, raw scan IDs and MRI montages are not committed (`.gitignore`).
