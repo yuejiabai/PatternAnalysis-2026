@@ -12,7 +12,6 @@ COMP3710 Pattern Recognition · Hard difficulty · Student s4985919 · Folder `r
 
 ![Validation curves of one ConvNeXt run](figures/convnext_training_curves.png)
 
-**[TODO: copy `training_curves.png` of one ConvNeXt run and of the CNN run from Rangpur into `figures/convnext_training_curves.png` and `figures/cnn_training_curves.png`.]**
 
 ## 2. Headline results
 
@@ -33,7 +32,9 @@ Breaking the official-split ensemble down by whether the test subject was seen i
 
 On new subjects the model still recognises CN scans, but it misses two thirds of AD slices. Because the unseen group is mostly AD, its overall accuracy falls to 50.8 %.
 
-**Test-set use.** The official test folder was already evaluated during development, before this write-up (Section 9). For the final models, checkpoints (best epoch), the AD threshold (0.5, fixed before training) and the reject rule were chosen on validation only, and nothing was changed after looking at the test breakdowns in Sections 5–7. The 3-slice input was preferred because it scored higher on validation than single-slice input (76.55 % vs 75.56 % at seed 42; Section 9). **[TODO: say whether test accuracies of single seeds were looked at before deciding to report the 3-seed ensemble.]**
+**Secondary, aggregated levels** (reported by `predict.py` for every evaluation since the start of the project, not the target metric): averaging the AD probability over the 20 slices of a scan, or over all scans of a subject, gives test accuracy 77.33 % per scan and 82.18 % per subject for the official-split ensemble (validation: 80.19 % and 84.07 %), and 66.44 % / 70.09 % for the strict-split model. The tutor confirmed that the assessed metric is slice-level, so these numbers are context only and do not mean the 0.80 target was met.
+
+**Test-set use.** The official test folder was already evaluated during development, before this write-up (Section 9). For the final models, checkpoints (best epoch), the AD threshold (0.5, fixed before training) and the reject rule were chosen on validation only, and nothing was changed after looking at the test breakdowns in Sections 5–7. The 3-slice input was preferred because it scored higher on validation than single-slice input (76.55 % vs 75.56 % at seed 42; Section 9). The ensemble is used because its validation accuracy (76.88 %) is higher than that of each of its three members (76.55–76.79 %). I cannot rule out that test accuracies of single seeds were also viewed during development; the saved logs in `run_logs/evaluation/` contain test results only for the runs listed in Section 9 and for the ensemble.
 
 ## 3. Data, pre-processing and splits
 
@@ -151,7 +152,7 @@ Measured on an NVIDIA A100 (Rangpur `comp3710` partition) with `torch.cuda.max_m
 | GPU forward time per slice, batch 16 | 0.587 ms for the **3-model ensemble** | 0.080 ms |
 | Peak GPU memory, inference | 100 MB with **3 models** loaded | 117 MB |
 | Peak GPU memory, training one model (batch 8, incl. EMA copy and validation) | 225 MB | 106 MB |
-| Wall-clock training time | **[TODO from Slurm logs]** per seed, 30 epochs | **[TODO]**, 30 epochs |
+| Wall-clock training time, 30 epochs incl. validation every epoch (Slurm elapsed time) | 53–56 min per seed (4 runs: 52:37, 55:29, 53:26, 53:26); about 2.7 h for the 3-seed ensemble | 21 min |
 
 Inference timing covers the GPU forward pass only (no JPEG decoding or loading) over the 9,000 test slices. A single ConvNeXt was not timed separately; it should cost roughly a third of the ensemble figure. Peak memory follows activation size more than parameter count: the CNN's first convolution runs at full 224 × 224 resolution, while the ConvNeXt stem down-samples by 4 immediately. Both models fit easily on a 16 GB P100.
 
@@ -172,7 +173,7 @@ All runs, read from each run's `config.json`, `history.json` and `best_meta.json
 | 5 | `convnext_patient_balanced_run01` | strict | + patient-balanced sampling | 8 | 76.37 % (6) | – | no gain |
 | 6 | `convnext_intensity_adamw_run01` | strict | + intensity (scale/gamma) augmentation | 8 | 77.71 % (7) | 77.71 % (epoch 7) | no gain |
 | 7 | `cnn_run01` | strict | SimpleCNN baseline, Adam, lr 1e-3 | 3 | 70.92 % (2) | – | baseline |
-| 8 | `convnext_official_aug_adamw_run01` | official | run 3's recipe on the official split | 8 | 73.04 % (8) | 72.15 % (epoch 6) | superseded |
+| 8 | `convnext_official_aug_adamw_run01` | official | run 3's recipe on the official split | 8 | 73.04 % (8) | 72.15 % (epoch 6) | evaluated on test during development (71.82 % slice accuracy); superseded |
 | 9 | `official_cosine_ema_single_s42` | official | final recipe (30 epochs, warm-up + cosine, EMA, label smoothing), single-slice input | 30 | 75.56 % (28) | 75.56 % (epoch 28) | – |
 | 10 | `official_cosine_ema_context3_s42` | official | final recipe, 3-slice context input | 30 | 76.59 % (24) | 76.55 % (epoch 21) | context3 better than single on validation; used |
 | 11 | `official_cosine_ema_context3_s43` | official | same, seed 43 | 30 | 76.67 % (20) | 76.67 % (epoch 20) | used |
@@ -183,7 +184,17 @@ The 3-seed ensemble of runs 10–12 reaches 76.88 % validation accuracy, slightl
 
 **Test result of run 3** (the strict-split model; AD threshold 0.67 chosen on validation, where slice/scan/patient accuracy was 0.788 / 0.855 / 0.886): test slice / scan / patient accuracy **0.658 / 0.664 / 0.701**, patient-level AUROC 0.770 and AD recall 0.473 (69 of 131 AD patients called CN). The large validation–test drop (0.79 → 0.66 at slice level) is a further sign of the shift between the training folder and the test folder.
 
-Other development analyses (validation data only): `diagnose_development.py` audits subject overlap, mixed labels across visits and split fingerprints; `test_brightness_sensitivity.py` measures how predictions change when validation images are made 10 % darker or brighter. **[TODO: one-line result of each.]**
+Other development analyses (no test data): `diagnose_development.py` audits subject overlap, mixed labels across visits and split fingerprints, and scores the fixed run-3 model (threshold 0.67) on its own training and validation subjects. Slice accuracy falls step by step as the data move further from what the model saw: **87.1 %** on training subjects (AUROC 0.941), **78.8 %** on new validation subjects (AUROC 0.863) and **65.8 %** on the test folder (AUROC 0.732). The first gap is ordinary over-fitting to training subjects; the second is the train-folder-to-test-folder shift discussed in Section 7. No validation subject had mixed AD/CN labels across visits.
+
+`test_brightness_sensitivity.py` measures how predictions change when validation images are made 10 % darker or brighter (run 3, AD threshold 0.67, a fixed sample of 280 validation slices from all 70 validation subjects and 122 scans; 95 % intervals from a 200-sample bootstrap over subjects):
+
+| Brightness factor | Accuracy | AD recall | CN recall | AUROC | Slices whose prediction flips |
+|---|---|---|---|---|---|
+| 1.0 (original) | 77.5 % | 76.4 % | 77.9 % | 0.851 | – |
+| 0.9 (10 % darker) | 77.9 % (change +0.4, CI −3.9 to +4.7) | 72.2 % | 79.8 % | 0.848 | 8.9 % (CI 5.7–12.9 %) |
+| 1.1 (10 % brighter) | 73.6 % (change **−3.9**, CI −7.1 to −0.7) | 75.0 % | 73.1 % (change −4.8, CI −8.6 to −1.3) | 0.840 | 6.1 % (CI 3.2–9.3 %) |
+
+A global brightness change of only 10 % flips 6–9 % of slice decisions, and brightening lowers accuracy significantly, mostly by calling more CN slices AD. The model is therefore sensitive to intensity differences of the size that can occur between scanners and protocols, which supports the acquisition-shift explanation in Section 7 and the recommendation of per-scan intensity normalisation. Training with random intensity (scale/gamma) augmentation (run 6) did not raise validation accuracy (77.71 % vs 77.75 %); its effect on this sensitivity was not measured.
 
 ## 10. Feasibility review (midpoint check-off) and outcome
 
