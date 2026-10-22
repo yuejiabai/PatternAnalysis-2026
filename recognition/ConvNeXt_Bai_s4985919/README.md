@@ -198,7 +198,7 @@ A global brightness change of only 10 % flips 6–9 % of slice decisions, and br
 
 ## 10. Feasibility review (midpoint check-off) and outcome
 
-**[TODO: replace this summary by the exact one-page review shown to the tutor, and add the check-off date and tutor name.]**
+<img width="1293" height="816" alt="image" src="https://github.com/user-attachments/assets/e58902b8-fc20-4695-8c2b-60ffbb5498b1" />
 
 1. **User need, scope, acceptance criteria.** A triage aid that labels AD vs CN slices and routes uncertain cases to a specialist. Acceptance criteria: (a) strict subject-level separation, (b) slice-level test accuracy ≥ 0.80, (c) comparison with a simple baseline on identical splits, (d) per-class metrics and a confidence/reject analysis, (e) training and inference fit a 16 GB P100 within 2-hour Slurm jobs.
 2. **Model choice and course concepts.** Compact from-scratch ConvNeXt [1] vs a simple CNN; depthwise convolutions, LayerNorm, inverted bottlenecks and stochastic depth; slice-level training with optional probability averaging per scan and per patient.
