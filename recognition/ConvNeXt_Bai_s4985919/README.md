@@ -198,22 +198,40 @@ A global brightness change of only 10 % flips 6–9 % of slice decisions, and br
 
 ## 10. Feasibility review (midpoint check-off) and outcome
 
-<img width="1293" height="816" alt="image" src="https://github.com/user-attachments/assets/e58902b8-fc20-4695-8c2b-60ffbb5498b1" />
+The one-page review below was presented to my practical tutor at the feasibility check-off on Tuesday 20 October 2026, and the check-off was recorded. It is reproduced as presented; the table after it compares its acceptance criteria with the final outcome.
 
-1. **User need, scope, acceptance criteria.** A triage aid that labels AD vs CN slices and routes uncertain cases to a specialist. Acceptance criteria: (a) strict subject-level separation, (b) slice-level test accuracy ≥ 0.80, (c) comparison with a simple baseline on identical splits, (d) per-class metrics and a confidence/reject analysis, (e) training and inference fit a 16 GB P100 within 2-hour Slurm jobs.
-2. **Model choice and course concepts.** Compact from-scratch ConvNeXt [1] vs a simple CNN; depthwise convolutions, LayerNorm, inverted bottlenecks and stochastic depth; slice-level training with optional probability averaging per scan and per patient.
-3. **Preliminary evidence.** Subject-level split 279 / 70 / 331 subjects; CNN and ConvNeXt train and predict end to end; first test accuracy below the target.
-4. **Risks, budget, fallback.** Few independent subjects, validation–test gap and missed AD cases; 2-hour GPU jobs with resumable checkpoints; fallback: CNN plus mandatory specialist review.
+10.1 Feasibility review as presented
 
-| Criterion | Outcome |
-|---|---|
-| (a) strict separation | Met in `strict` mode (65.78 %); the 75.31 % official-split result violates it and is labelled as such |
-| (b) accuracy ≥ 0.80 | **Not met** |
-| (c) baseline comparison | Met (Section 5) |
-| (d) per-class metrics, reject analysis | Met (Sections 5–6) |
-| (e) resources | Met (Section 8) |
+1. User need, scope and acceptance criteria. A research prototype for clinical researchers: classify 2D brain MRI slices as Alzheimer's disease (AD) or cognitively normal (CN/NC), with uncertain cases referred for human review. It is not a medical diagnostic system.
 
-**Why 0.80 was not reached.** Under an equal-variance normal approximation, 80 % accuracy needs an AUROC of about 0.88; the best AUROC is 0.847 on the leaky split and about 0.73 on the strict split. To reach 80 % on the official test while seen subjects stay at 90.4 %, accuracy on the 115 unseen subjects would have to rise from 50.8 % to about 63 %. Augmentation, 2.5D input, EMA, a cosine schedule and ensembling did not move unseen-subject performance. One untried, legitimate idea is a validation set matched to the test era (recent IR-FSPGR/MPRAGE subjects from the training folder) with per-scan intensity normalisation, followed by a single, disclosed re-test.
+AC1 Data integrity. Keep training/validation subjects separate; quantify potential overlap in the provided train/test folders and report a patient-disjoint comparison.
+AC2 Accuracy. Aim for ≥ 80 % slice-level accuracy on the course-provided test set (course target; not yet reached).
+AC3 Baseline. Compare ConvNeXt with a simple CNN on matched splits using accuracy, per-class recall/F1 and AUROC.
+AC4 Reliability. Report confidence-based referral coverage, accuracy among accepted slices and missed AD cases; ≥ 90 % accepted accuracy is a target, not an achieved result.
+AC5 Compute. Target one ≤ 2-hour Rangpur GPU job per run and < 16 GB peak VRAM; record measured VRAM and inference latency separately.
+
+2. Model choice and course concepts. A compact ConvNeXt (Liu et al., 2022) trained from scratch without pretrained weights. It retains four stages (depths 2–2–4–2, widths 32/64/128/256; ~1.9M parameters), 7×7 depthwise convolutions, LayerNorm, GELU, residual blocks, LayerScale and stochastic depth. A simple CNN serves as the baseline. Relevant concepts include hierarchical features, residual learning, weight decay, training-only augmentation, patient-level splitting, ROC/AUROC and confidence calibration.
+
+3. Preliminary feasibility evidence.
+
+Data and identity audit. Each scan has 20 exported JPEGs. Metadata links image/scan identifiers to ADNI subject IDs; 216 subject IDs appeared in both provided train and test under this mapping. Interpretation remains under teaching-team review. Removing related training scans leaves 349 development subjects (279 train / 70 validation).
+Working pipeline. CNN and ConvNeXt have run end-to-end on Rangpur. Strict-split validation slice accuracy at threshold 0.50: ConvNeXt 77.75 %, CNN 70.92 %. Historical strict-split test accuracy was 65.78 %: below target. A separate course-provided-split test figure of 75.3 % is preliminary and requires original-run log confirmation.
+Resources. An 8-epoch ConvNeXt run completed on an A100 within a 2-hour allocation; exact peak VRAM and per-slice latency have not yet been independently verified.
+
+4. Risks, budget and fallback.
+
+Risks. Potential subject overlap in the provided split; poorer generalisation to independent patients, especially AD false negatives; uncertain upstream MRI-to-JPEG slice selection and intensity handling; overconfident errors.
+Plan and budget. Use the course-provided split for the primary course report as the tutor advised; label the strict patient-disjoint analysis separately. Reserve ~10–15 GPU-hours overall, with resumable ≤ 2-hour jobs. Any new preprocessing choice must be assessed using development data only, not selected by test accuracy.
+Fallback. If 80 % is not achieved, report both protocols honestly, compare against CNN, analyse 3–5 failure cases and recommend mandatory human review rather than autonomous diagnosis.
+10.2 Outcome against the acceptance criteria
+Criterion	Outcome
+AC1 Data integrity	Met. Training and validation are split by subject and this is asserted in code; the 216 subjects shared by the provided train and test folders are quantified (Section 2); a patient-disjoint comparison is reported (65.78 %, Section 2)
+AC2 Accuracy ≥ 80 %	Not met. 75.31 % on the provided split (not subject-independent), 65.78 % with strict subject separation
+AC3 Baseline	Met. Same splits and test slices, accuracy, per-class precision/recall/F1 and AUROC (Section 5)
+AC4 Reliability	Reported; target met on validation only. The reject rule reaches 90.0 % accepted accuracy on validation (52.7 % coverage) but 84.6 % on test, with 757 AD slices missed and not referred (Section 6)
+AC5 Compute	Met. 53–56 min per 30-epoch run, 225 MB peak training memory, 100 MB inference memory and 0.587 ms per slice for the 3-model ensemble on an A100 (Section 8)
+
+Why 0.80 was not reached. Under an equal-variance normal approximation, 80 % accuracy needs an AUROC of about 0.88; the best AUROC is 0.847 on the leaky split and about 0.73 on the strict split. To reach 80 % on the official test while seen subjects stay at 90.4 %, accuracy on the 115 unseen subjects would have to rise from 50.8 % to about 63 %. Augmentation, 2.5D input, EMA, a cosine schedule and ensembling did not move unseen-subject performance. One untried, legitimate idea is a validation set matched to the test era (recent IR-FSPGR/MPRAGE subjects from the training folder) with per-scan intensity normalisation, followed by a single, disclosed re-test.
 
 ## 11. Recommendation to the project manager
 
