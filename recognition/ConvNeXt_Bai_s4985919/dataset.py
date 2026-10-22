@@ -1,4 +1,11 @@
+"""Data loading, subject-level splits and training-only augmentation for ADNI.
 
+Subject IDs are read from the course metadata JSON (the filename prefix is a
+scan ID, not a subject ID). load_datasets() returns (train, validation, test):
+validation is always split by subject; split_mode "strict" also removes every
+training subject that appears in the official test folder. input_mode
+"context3" stacks the previous/current/next slice of the same scan as channels.
+"""
 import json
 import os
 import random

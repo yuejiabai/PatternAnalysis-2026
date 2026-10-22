@@ -1,4 +1,10 @@
+"""Model components for the COMP3710 ADNI project (PyTorch only).
 
+A compact ConvNeXt (Liu et al., "A ConvNet for the 2020s", CVPR 2022) written
+from scratch: a 4x4 patchify stem, four stages of ConvNeXt blocks separated by
+2x2 down-sampling layers, global average pooling and a linear classifier.
+No pretrained weights are used.
+"""
 import torch
 import torch.nn as nn
 

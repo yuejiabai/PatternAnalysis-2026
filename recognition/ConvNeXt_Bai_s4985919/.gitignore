@@ -13,8 +13,7 @@ diagnostics/
 *.nii.gz
 *.jpeg
 *.jpg
-# Medical images are never committed; approved self-made report charts may be committed under docs/figures.
-# Keep only intentionally selected, approved figures in docs/figures if allowed.
+# Medical images are never committed; summary charts used by the README live in figures/.
 # Slurm logs and evaluation outputs (may contain data paths); keep out of git.
 *.out
 *.err
