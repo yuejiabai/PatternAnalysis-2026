@@ -5,7 +5,6 @@
 #SBATCH --partition=comp3710
 #SBATCH --account=comp3710
 #SBATCH --gres=gpu:1
-#SBATCH --mem=16G
 #SBATCH --time=02:00:00
 #SBATCH --output=convnext_official_%j.out
 #SBATCH --error=convnext_official_%j.err
