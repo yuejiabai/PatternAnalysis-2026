@@ -25,6 +25,7 @@ import csv
 import hashlib
 import json
 import math
+import os
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -33,7 +34,7 @@ import torch
 from torch.utils.data import DataLoader, Subset
 
 from dataset import (get_image_id, load_datasets, load_patient_map, get_transform,
-                     SPLIT_MODES, INPUT_MODES)
+                     SPLIT_MODES, INPUT_MODES, DATA_ROOT)
 from modules import ConvNeXt
 from baseline import build_baseline, MODEL_NAMES
 
@@ -45,13 +46,30 @@ DEFAULT_CHECKPOINTS = [
 ]
 
 
-def fingerprint_split(dataset):
-    """Identical algorithm to train.py; detect changed membership/order/labels."""
+def fingerprint_split(dataset, root_alias=None):
+    """Identical algorithm to train.py; detect changed membership/order/labels.
+
+    The hash covers absolute file paths. root_alias replaces the current data
+    root (dataset.DATA_ROOT) by the root used on the training machine, so a
+    checkpoint trained on another machine with an identical copy of the data
+    can be verified exactly (same files, order and labels below the root).
+    """
     samples = get_sample_info(dataset)
+    root = str(DATA_ROOT)
     digest = hashlib.sha256()
     for path, label in samples:
+        path = str(path)
+        if root_alias is not None and path.startswith(root):
+            path = root_alias + path[len(root):]
         digest.update(f"{path}\t{label}\n".encode("utf-8"))
     return digest.hexdigest()
+
+
+def fingerprint_root_aliases():
+    """Data roots of other training machines, from ADNI_FINGERPRINT_ROOT_ALIASES
+    (comma-separated), e.g. the GPU Lab copy of the same corrected dataset."""
+    value = os.environ.get("ADNI_FINGERPRINT_ROOT_ALIASES", "")
+    return [alias.strip().rstrip("/") for alias in value.split(",") if alias.strip()]
 
 
 def patient_mapping_fingerprint(datasets, patient_map):
@@ -94,13 +112,23 @@ def check_checkpoint_compatibility(metadata, args, train_ds, val_ds, test_ds, pa
     expected = metadata.get("split_fingerprint")
     if not isinstance(expected, dict) or set(expected) != {"train", "validation", "test"}:
         raise ValueError("Incomplete split fingerprint in best_meta.json")
-    actual = {"train": fingerprint_split(train_ds),
-              "validation": fingerprint_split(val_ds),
-              "test": fingerprint_split(test_ds)}
-    for split in actual:
-        if expected[split] != actual[split]:
-            raise ValueError(f"{split} patient split/membership/order mismatch; "
-                             "do not compare these metrics with the checkpoint")
+    matched_alias = "no match"
+    for alias in [None] + fingerprint_root_aliases():
+        actual = {"train": fingerprint_split(train_ds, alias),
+                  "validation": fingerprint_split(val_ds, alias),
+                  "test": fingerprint_split(test_ds, alias)}
+        if all(expected[split] == actual[split] for split in actual):
+            matched_alias = alias
+            break
+    if matched_alias == "no match":
+        first = next(split for split in ("train", "validation", "test")
+                     if expected[split] != fingerprint_split(
+                         {"train": train_ds, "validation": val_ds, "test": test_ds}[split]))
+        raise ValueError(f"{first} patient split/membership/order mismatch; "
+                         "do not compare these metrics with the checkpoint")
+    if matched_alias is not None:
+        print(f"NOTE: split fingerprints match after mapping data root {DATA_ROOT} -> "
+              f"{matched_alias} (checkpoint trained on another machine with the same data).")
     expected_patient = metadata.get("patient_mapping_fingerprint")
     if not expected_patient:
         raise ValueError("Checkpoint missing patient mapping fingerprint; check metadata version")
