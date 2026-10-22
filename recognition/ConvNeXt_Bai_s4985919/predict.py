@@ -4,9 +4,12 @@ Use *validation* to verify the locked protocol before running the official test.
 The test split is guarded by --confirm-final-test to discourage tuning on test.
 No training or model selection occurs in this script.
 
-Example (previously chosen on validation):
-    python -u predict.py --split validation --threshold 0.67
-    python -u predict.py --split test --threshold 0.67 --confirm-final-test
+Examples (by default the final 3-seed ConvNeXt ensemble is loaded and the
+AD threshold is read from its best_meta.json, i.e. fixed on validation):
+    python -u predict.py --split validation --num-workers 4
+    python -u predict.py --split test --confirm-final-test --num-workers 4
+    python -u predict.py --model cnn --split validation \
+        --checkpoint checkpoints/cnn/cnn_official_cosine_ema_s42/best.pth
 
 AD=0 (positive class), NC=1. Scan predictions average 20 slice AD
 probabilities; patient predictions average the scores of that patient's scans.
@@ -32,12 +35,14 @@ from torch.utils.data import DataLoader, Subset
 from dataset import (get_image_id, load_datasets, load_patient_map, get_transform,
                      SPLIT_MODES, INPUT_MODES)
 from modules import ConvNeXt
-from baseline import SimpleCNN
+from baseline import build_baseline, MODEL_NAMES
 
 
-DEFAULT_CHECKPOINT = Path(
-    "checkpoints/convnext/convnext_aug_adamw_run01/best.pth"
-)
+# Final model: 3-seed ensemble of the official-split, context3 ConvNeXt runs.
+DEFAULT_CHECKPOINTS = [
+    Path(f"checkpoints/convnext/official_cosine_ema_context3_s{seed}/best.pth")
+    for seed in (42, 43, 44)
+]
 
 
 def fingerprint_split(dataset):
@@ -287,10 +292,10 @@ def save_anonymized_details(path, records, threshold, salt):
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--split", choices=["validation", "test"], default="validation")
-    p.add_argument("--checkpoint", type=Path, nargs="+", default=[DEFAULT_CHECKPOINT],
+    p.add_argument("--checkpoint", type=Path, nargs="+", default=DEFAULT_CHECKPOINTS,
                    help="One best.pth, or several to average their AD probabilities "
                         "(ensemble); all must share split mode, input mode and threshold")
-    p.add_argument("--model", choices=["convnext", "cnn"], default="convnext",
+    p.add_argument("--model", choices=list(MODEL_NAMES), default="convnext",
                    help="Architecture to load; explicit for legacy checkpoints")
     p.add_argument("--threshold", type=float, default=None,
                    help="AD cutoff; default uses saved best_meta.json, else 0.50")
@@ -370,8 +375,8 @@ def main():
 
     models = []
     for checkpoint in args.checkpoint:
-        model = (ConvNeXt(num_classes=2, in_channels=3)
-                 if args.model == "convnext" else SimpleCNN()).to(device)
+        model = (ConvNeXt(num_classes=2, in_channels=3) if args.model == "convnext"
+                 else build_baseline(args.model)).to(device)
         # The project's best.pth saves the raw state_dict (NOT the resume dict).
         state = torch.load(checkpoint, map_location=device)
         if not isinstance(state, dict) or "model_state" in state:

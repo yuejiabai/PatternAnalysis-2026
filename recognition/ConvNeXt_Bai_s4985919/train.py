@@ -30,7 +30,7 @@ from dataset import (load_datasets, load_patient_map, get_transform,
 from mri_intensity import intensity_protocol, make_training_input
 from predict import (create_records, evaluate, get_sample_info,
                      patient_mapping_fingerprint)
-from baseline import SimpleCNN
+from baseline import build_baseline, MODEL_NAMES
 from modules import ConvNeXt
 
 # Signal handlers ask the training loop to save after the current optimizer step.
@@ -343,11 +343,12 @@ def main():
                         help="Model weights for --test-only (raw best.pth)")
     parser.add_argument("--test-threshold", type=float, default=None,
                         help="Optional threshold explicitly locked on development data")
-    parser.add_argument("--test-model", choices=["convnext", "cnn"], default="convnext",
+    parser.add_argument("--test-model", choices=list(MODEL_NAMES), default="convnext",
                         help="Architecture used for --test-only (legacy checkpoints)")
     parser.add_argument("--confirm-final-test", action="store_true",
                         help="Acknowledge official test should not be used for tuning")
-    parser.add_argument("--model", choices=["cnn", "convnext"], default="cnn")
+    parser.add_argument("--model", choices=list(MODEL_NAMES), default="cnn",
+                        help="cnn: small SimpleCNN; cnn_matched: CNN with a ConvNeXt-like parameter count")
     parser.add_argument("--split-mode", choices=list(SPLIT_MODES), default="strict",
                         help="strict: remove subjects shared with official test (default); "
                              "official: use the course train/test folders as provided")
@@ -464,7 +465,8 @@ def main():
         val_dataset, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, generator=torch.Generator().manual_seed(args.seed + 2000000)
     )
-    model = SimpleCNN() if args.model == "cnn" else ConvNeXt(num_classes=2, in_channels=3)
+    model = (ConvNeXt(num_classes=2, in_channels=3) if args.model == "convnext"
+             else build_baseline(args.model))
     model = model.to(device)
     ema_model = None
     if args.ema_decay > 0:

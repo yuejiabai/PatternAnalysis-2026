@@ -373,7 +373,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--checkpoint", type=Path, nargs="+", required=True)
-    parser.add_argument("--model", choices=["convnext", "cnn"], default="convnext")
+    parser.add_argument("--model", choices=["convnext", "cnn", "cnn_matched"], default="convnext")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--target-accuracy", type=float, default=0.90,
                         help="Reject rule: accepted VALIDATION accuracy to reach (fixed in advance)")
@@ -391,7 +391,7 @@ def main():
     from predict import (load_best_metadata, check_checkpoint_compatibility,
                          get_sample_info)
     from modules import ConvNeXt
-    from baseline import SimpleCNN
+    from baseline import build_baseline
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     all_meta = [load_best_metadata(c) for c in args.checkpoint]
@@ -419,7 +419,7 @@ def main():
     models = []
     for checkpoint in args.checkpoint:
         model = (ConvNeXt(num_classes=2, in_channels=3) if args.model == "convnext"
-                 else SimpleCNN()).to(device)
+                 else build_baseline(args.model)).to(device)
         model.load_state_dict(torch.load(checkpoint, map_location=device), strict=True)
         model.eval()
         models.append(model)
