@@ -4,6 +4,34 @@ COMP3710 Pattern Recognition · Hard difficulty · Student s4985919 · Folder `r
 
 > Research prototype, not a clinical tool. **The 0.80 test-accuracy target was not reached by ConvNeXt**: 75.31 % slice-level test accuracy on the provided split (which shares subjects between train and test), 65.78 % with strict subject separation, and 76.19 % on the corrected subject-disjoint split released by the teaching team. On that corrected split, a plain CNN with the same number of parameters reached 85.16 % (Section 10).
 
+**Key findings** (details in the linked sections)
+
+- **The provided split leaks subjects.** The filename prefix is an image ID, not a patient ID (confirmed by the teaching team); mapped to subject IDs, 216 of the 331 test subjects also have a scan in the training folder. ConvNeXt scores 90.4 % on those subjects but 50.8 % on the 115 new ones ([Section 2](#2-headline-results)).
+- **On the corrected subject-disjoint split, ConvNeXt reaches 76.19 %** (AUROC 0.840), still below the 0.80 target ([Section 10](#10-patient-leakage-re-evaluation-on-the-corrected-subject-disjoint-split)).
+- **At equal size, a plain CNN is better on this data:** 85.16 % vs 76.19 % test accuracy, with better calibration and fewer confident errors ([Section 10.2](#102-findings)).
+- **Confidence is only partly trustworthy.** A reject rule set to 90 % accepted accuracy on validation gives 84.6 % on the provided test split and 86.6 % (ConvNeXt) / 92.3 % (MatchedCNN) on the corrected split ([Sections 6](#6-open-dilemma-confidence-calibration-and-a-reject-option) and [10](#101-results-test-202-unseen-subjects-9000-slices)).
+- **Scan year and label are confounded** in both test sets, so part of the accuracy may come from acquisition era rather than disease ([Sections 7](#7-where-and-why-it-fails-official-test-convnext-ensemble) and [10.2](#102-findings)).
+- **The corrected-split protocol was committed before any test evaluation on that split** ([`run_logs/adni_v2/PROTOCOL.md`](run_logs/adni_v2/PROTOCOL.md)); every number comes from logs in [`run_logs/`](run_logs/).
+
+**Where to find each part of the report**
+
+| Report item | Section |
+|---|---|
+| Problem, how the algorithm works, example input and output | [1](#1-problem-and-algorithm) |
+| Headline results and how the test set was used | [2](#2-headline-results) |
+| Pre-processing, data splits and their justification | [3](#3-data-pre-processing-and-splits) |
+| Training recipe | [4](#4-training) |
+| Baseline comparison | [5](#5-baseline-comparison-official-split-identical-test-slices) (SimpleCNN), [10](#10-patient-leakage-re-evaluation-on-the-corrected-subject-disjoint-split) (parameter-matched CNN) |
+| Open dilemma: confidence, calibration and reject option | [6](#6-open-dilemma-confidence-calibration-and-a-reject-option) |
+| Failure analysis and five failure cases | [7](#7-where-and-why-it-fails-official-test-convnext-ensemble) |
+| Resource profile (parameters, GPU memory, time) | [8](#8-resource-profile), [10.1](#101-results-test-202-unseen-subjects-9000-slices) |
+| Experiment history | [9](#9-experiment-history) |
+| Patient leakage and the corrected split | [10](#10-patient-leakage-re-evaluation-on-the-corrected-subject-disjoint-split) |
+| Feasibility review and outcome | [11](#11-feasibility-review-midpoint-check-off-and-outcome) |
+| Recommendation to the project manager | [12](#12-recommendation-to-the-project-manager) |
+| Dependencies, commands and reproducibility | [13](#13-usage-and-reproducibility) |
+| AI usage disclosure | [14](#14-artificial-intelligence-usage-disclosure) |
+
 ## 1. Problem and algorithm
 
 **Problem.** Alzheimer's disease (AD) causes progressive cortical and hippocampal atrophy and ventricular enlargement that is visible on T1-weighted structural MRI. The task is to classify 2D MRI slices from the course ADNI data as AD or cognitively normal (CN; the course folder calls this class `NC`). The teaching team confirmed that the target metric is **slice-level accuracy on the official test folder** and that pretrained weights are not allowed. The open engineering question for this project is whether the model's confidence can be trusted to send ambiguous cases to a human reader, and whether a modern architecture justifies its cost over a simple baseline.
@@ -31,7 +59,7 @@ COMP3710 Pattern Recognition · Hard difficulty · Student s4985919 · Folder `r
 | **Corrected split** (teaching-team release, 0 shared subjects; Section 10) | ConvNeXt, 3-seed ensemble, same recipe | **76.19 %** | 0.840 | Generalisation to new subjects with matched train/test distributions |
 | Corrected split, same test slices | MatchedCNN (parameter-matched plain CNN), 3-seed ensemble | 85.16 % | 0.929 | Is ConvNeXt's design worth it at equal model size? |
 
-Why two splits: the course folders are separated by *scan* (ADNI Image ID), not by *subject*. Mapping image IDs to subject IDs with the course metadata shows 216 subjects with different visits in both folders. I reported this to the teaching team on Ed. The tutor (Zhao Wang, 18 Oct 2026, thread now private) advised using **the provided split as the primary result** and reporting the patient-disjoint results as a clearly labelled comparison, which is what this report does. The official split is therefore the primary result, but it is not subject-independent; the strict split is the better estimate for completely new patients. After the teaching team released a corrected subject-disjoint copy of the data (22 Oct 2026), I re-ran the final recipe on it under a protocol fixed in advance; Section 10 reports these results and what they reveal about patient leakage.
+Why two splits: the course folders are separated by *scan* (ADNI Image ID), not by *subject*. Mapping image IDs to subject IDs with the course metadata shows 216 subjects with different visits in both folders. I reported this to the teaching team on Ed, and the teaching team (Wei Dai) confirmed that the filename prefix is an image ID plus slice number, not a patient ID. The tutor (Zhao Wang, 18 Oct 2026, thread now private) advised using **the provided split as the primary result** and reporting the patient-disjoint results as a clearly labelled comparison, which is what this report does. The official split is therefore the primary result, but it is not subject-independent; the strict split is the better estimate for completely new patients. After the teaching team released a corrected subject-disjoint copy of the data (22 Oct 2026), I re-ran the final recipe on it under a protocol fixed in advance; Section 10 reports these results and what they reveal about patient leakage.
 
 Breaking the official-split ensemble down by whether the test subject was seen in training shows where the score comes from:
 
@@ -48,7 +76,7 @@ On new subjects the model still recognises CN scans, but it misses two thirds of
 
 ## 3. Data, pre-processing and splits
 
-- Data: `/home/groups/comp3710/ADNI/AD_NC` (`train/` and `test/`, classes `AD` and `NC`) and the metadata file `/home/groups/comp3710/ADNI/meta_data_with_label.json`. Each scan contributes 20 JPEG slices named `scanID_sliceNo.jpeg`; the prefix is the ADNI Image ID of one scan, not a patient. The subject ID (e.g. `137_S_4672`) is taken from the metadata `raw` path with the regex `\d{3}_S_\d{4}`.
+- Data: `/home/groups/comp3710/ADNI/AD_NC` (`train/` and `test/`, classes `AD` and `NC`) and the metadata file `/home/groups/comp3710/ADNI/meta_data_with_label.json`. Each scan contributes 20 JPEG slices named `scanID_sliceNo.jpeg`; the prefix is the ADNI Image ID of one scan, not a patient. The subject ID (format `NNN_S_NNNN`) is taken from the metadata `raw` path with the regex `\d{3}_S_\d{4}`.
 - Labels: AD = class 0 (positive class for recall and AUROC), CN = class 1, following ImageFolder order. The mapping is asserted in every script.
 - Pre-processing (`dataset.py`): resize to 224 × 224, convert to greyscale, replicate to 3 channels, scale to [0, 1] and normalise with mean = std = 0.5, so pixels lie in [−1, 1].
 - Input modes: `single` copies one slice into the 3 channels. `context3` (2.5D) puts the previous, current and next slice **of the same scan** into the 3 channels, with edge slices repeated. Every sample is still one slice with its own label, so evaluation stays per slice.
@@ -83,6 +111,8 @@ Baseline: `SimpleCNN` (3 conv layers 16/32/64 + ReLU + max-pool, global average 
 
 ![Test confusion matrix, ConvNeXt](figures/convnext_test_confusion.png)
 ![ROC curves, ConvNeXt](figures/convnext_roc.png)
+
+The same plots for SimpleCNN: [confusion matrix](figures/cnn_test_confusion.png), [ROC](figures/cnn_roc.png), [coverage vs accuracy](figures/cnn_coverage_accuracy.png), [accuracy by group](figures/cnn_test_accuracy_by_group.png).
 
 Caveats:
 - The ConvNeXt column bundles architecture, 3-slice input and a 3-model ensemble, so the 8.9-point gap is a *pipeline* difference, not an architecture-only effect. A single-seed, single-slice ConvNeXt was not evaluated on test, to avoid extra test looks. The fairer comparison (same input, same ensemble size and a similar parameter count) was done later on the corrected split and reverses the conclusion (Section 10).
@@ -204,7 +234,7 @@ Other development analyses (training and validation data only; aggregate outputs
 | 0.9 (10 % darker) | 77.9 % (change +0.4, CI −3.9 to +4.7) | 72.2 % | 79.8 % | 0.848 | 8.9 % (CI 5.7–12.9 %) |
 | 1.1 (10 % brighter) | 73.6 % (change **−3.9**, CI −7.1 to −0.7) | 75.0 % | 73.1 % (change −4.8, CI −8.6 to −1.3) | 0.840 | 6.1 % (CI 3.2–9.3 %) |
 
-A global brightness change of only 10 % flips 6–9 % of slice decisions, and brightening lowers accuracy significantly, mostly by calling more CN slices AD. The model is therefore sensitive to intensity differences of the size that can occur between scanners and protocols, which supports the acquisition-shift explanation in Section 7 and the recommendation of per-scan intensity normalisation. Training with random intensity (scale/gamma) augmentation (run 6) did not raise validation accuracy (77.71 % vs 77.75 %); its effect on this sensitivity was not measured.
+A global brightness change of only 10 % flips 6–9 % of slice decisions, and brightening lowers accuracy significantly, mostly by calling more CN slices AD. The model is therefore sensitive to intensity differences of the size that can occur between scanners and protocols, which is consistent with, but does not prove, the acquisition-shift explanation in Section 7 and the recommendation of per-scan intensity normalisation. Training with random intensity (scale/gamma) augmentation (run 6) did not raise validation accuracy (77.71 % vs 77.75 %); its effect on this sensitivity was not measured.
 
 ## 10. Patient leakage: re-evaluation on the corrected subject-disjoint split
 
@@ -224,6 +254,10 @@ Seeds 42 and 43 of ConvNeXt were trained on Rangpur (A100); ConvNeXt seed 44 and
 | **Accuracy** | **76.19 %** | **85.16 %** |
 | AUROC (AD positive) | 0.840 | 0.929 |
 | AD recall / CN recall | 74.8 % / 77.6 % | 82.4 % / 87.9 % |
+| AD precision | 0.766 | 0.870 |
+| AD F1 | 0.757 | 0.846 |
+| CN precision | 0.758 | 0.835 |
+| CN F1 | 0.767 | 0.857 |
 | Macro-F1 | 0.762 | 0.851 |
 | Confusion (TP, FN, FP, TN; AD positive) | 3336, 1124, 1019, 3521 | 3673, 787, 549, 3991 |
 | Validation accuracy / AUROC | 79.12 % / 0.869 | 83.76 % / 0.911 |
@@ -240,6 +274,8 @@ All numbers are in [`run_logs/adni_v2/`](run_logs/adni_v2/). ConvNeXt **does not
 
 ![Test accuracy by group, ConvNeXt, corrected split](figures/adni_v2_convnext_test_accuracy_by_group.png)
 ![Reliability diagram, MatchedCNN, corrected split](figures/adni_v2_matched_reliability.png)
+
+Further corrected-split plots. ConvNeXt: [confusion matrix](figures/adni_v2_convnext_test_confusion.png), [ROC](figures/adni_v2_convnext_roc.png), [coverage vs accuracy](figures/adni_v2_convnext_coverage_accuracy.png), [reliability](figures/adni_v2_convnext_reliability.png). MatchedCNN: [confusion matrix](figures/adni_v2_matched_test_confusion.png), [ROC](figures/adni_v2_matched_roc.png), [coverage vs accuracy](figures/adni_v2_matched_coverage_accuracy.png), [accuracy by group](figures/adni_v2_matched_test_accuracy_by_group.png).
 
 Validation and test differ by about 3 points in opposite directions for the two models (ConvNeXt 79.1 % → 76.2 %, MatchedCNN 83.8 % → 85.2 %). With only 96 validation and 202 test subjects, shifts of this size are plausible from which patients land in each split (no confidence interval was computed); the 9-point gap between the two models on the same 9,000 test slices is three times larger and has the same sign on validation (+4.6 points).
 
@@ -392,7 +428,7 @@ Reject rule (chosen on validation for 90% accepted accuracy): confidence >= 0.92
 | `run_logs/adni_v2/` | Corrected subject-disjoint split (Section 10): evaluation protocol committed before testing, training logs of the six runs, Slurm records, GPU Lab environment and all evaluation outputs |
 | `figures/` | Plots used in this README (`adni_v2_*`: corrected split); the only MRI content is the two example slices in `example_inputs.png` |
 
-Datasets, checkpoints, logs, raw scan IDs and MRI montages are not committed (`.gitignore`).
+Datasets, checkpoints, raw Slurm output files (`*.out`), raw scan IDs and MRI montages are not committed (`.gitignore`). The logs in `run_logs/` are cleaned copies with settings and aggregate metrics only.
 
 ## 14. Artificial Intelligence Usage Disclosure
 
