@@ -2,12 +2,12 @@
 
 COMP3710 Pattern Recognition · Hard difficulty · Student s4985919 · Folder `recognition/ConvNeXt_Bai_s4985919/`
 
-> Research prototype, not a clinical tool. **The 0.80 test-accuracy target was not reached by ConvNeXt**: 75.31 % slice-level test accuracy on the provided split (which shares subjects between train and test), 65.78 % with strict subject separation, and 76.19 % on the corrected subject-disjoint split released by the teaching team. On that corrected split, a plain CNN with the same number of parameters reached 85.16 % (Section 10).
+> Research prototype, not a clinical tool. ConvNeXt reaches 75.31 % slice-level test accuracy on the provided split (which shares subjects between train and test), 65.78 % with strict subject separation, and 76.19 % on the corrected subject-disjoint split released by the teaching team. On that corrected split, a plain CNN with the same number of parameters reached 85.16 % (Section 10).
 
 **Key findings** (details in the linked sections)
 
 - **The provided split leaks subjects.** The filename prefix is an image ID, not a patient ID (confirmed by the teaching team); mapped to subject IDs, 216 of the 331 test subjects also have a scan in the training folder. ConvNeXt scores 90.4 % on those subjects but 50.8 % on the 115 new ones ([Section 2](#2-headline-results)).
-- **On the corrected subject-disjoint split, ConvNeXt reaches 76.19 %** (AUROC 0.840), still below the 0.80 target ([Section 10](#10-patient-leakage-re-evaluation-on-the-corrected-subject-disjoint-split)).
+- **On the corrected subject-disjoint split, ConvNeXt reaches 76.19 %** (AUROC 0.840; [Section 10](#10-patient-leakage-re-evaluation-on-the-corrected-subject-disjoint-split)).
 - **At equal size, a plain CNN is better on this data:** 85.16 % vs 76.19 % test accuracy, with better calibration and fewer confident errors ([Section 10.2](#102-findings)).
 - **Confidence is only partly trustworthy.** A reject rule set to 90 % accepted accuracy on validation gives 84.6 % on the provided test split and 86.6 % (ConvNeXt) / 92.3 % (MatchedCNN) on the corrected split ([Sections 6](#6-open-dilemma-confidence-calibration-and-a-reject-option) and [10](#101-results-test-202-unseen-subjects-9000-slices)).
 - **Scan year and label are confounded** in both test sets, so part of the accuracy may come from acquisition era rather than disease ([Sections 7](#7-where-and-why-it-fails-official-test-convnext-ensemble) and [10.2](#102-findings)).
@@ -193,7 +193,7 @@ To go beyond metadata, `failure_autopsy.py` re-scores the test split with the fr
 | Split | Case | Truth → pred | Scan P(AD) | Wrong slices | Sequence, year | Subject in training? | Other visits (label, year) |
 |---|---|---|---|---|---|---|---|
 | official | missed AD, most confident | AD → CN | 0.05 | 20/20 | Accel. Sag. MPRAGE, 2018 | no | AD 2019 (test) |
-| official | missed AD, typical | AD → CN | 0.18 | 17/20 | MPRAGE, 2014 | **yes** | AD 2011, 2012 ×2 (train) |
+| official | missed AD, typical | AD → CN | 0.18 | 17/20 | MPRAGE, 2014 | **yes** | AD 2011, 2012 ×3 (train) |
 | official | false alarm, most confident | CN → AD | 0.88 | 20/20 | Accel. Sag. IR-FSPGR, 2021 | yes | CN 2017 (train) |
 | official | false alarm, typical | CN → AD | 0.59 | 15/20 | Sag. 3D Accel. MPRAGE, 2019 | yes | CN 2017 (train) |
 | corrected | missed AD, most confident | AD → CN | 0.05 | 20/20 | MPRAGE, 2013 | no | none |
@@ -204,10 +204,12 @@ To go beyond metadata, `failure_autopsy.py` re-scores the test split with the fr
 What the checks show (eight cases, so these are observations, not proof):
 1. **A diagnosis change between visits does not explain these cases.** None of the eight subjects has visits with different labels; every false alarm is a subject labelled CN at all of its visits, so the label-change hypothesis for cases 3–4 is not supported.
 2. **Errors are whole-scan, not a few bad slices.** 14–20 of the 20 slices are wrong in every error case, typical ones included, so the trigger is something that affects the whole scan (its overall appearance or acquisition), not slice position at the edges of the brain.
-3. **Seeing the subject in training does not protect against errors.** On the official split the typical missed AD comes from a subject with three AD-labelled visits in training, and both false alarms come from subjects whose CN visits were in training. So the model did not simply memorise subjects.
+3. **Seeing the subject in training does not protect against errors.** On the official split the typical missed AD comes from a subject with four AD-labelled visits in training, and both false alarms come from subjects whose CN visits were in training. So the model did not simply memorise subjects.
 4. **Acquisition era is not the whole story.** On the corrected split both selected missed AD scans are from 2013, the era in which AD recall is highest (80 %, Section 10.2). So era may contribute to the aggregate results (Section 10.2, finding 4), but it does not explain every confident error.
 
-*Mitigation:* the reject option (Section 6) can at most help with the less confident errors; the most confident ones (scan P(AD) 0.05, 0.88, 0.92) would still be decided automatically and wrongly. So a CN prediction should never clear a patient on its own, and the next experiment is a scan-level intensity/acquisition audit (e.g. harmonisation across sequences), not more training of the same model.
+5. **Grad-CAM gives a coarse but consistent hint (7 × 7 feature map, so only a rough guide).** On the official split the maps lie mostly on brain tissue near the centre of the slice for correct and wrong cases alike, so the errors are not explained by the model looking somewhere obviously different. On the corrected split, the maps for CN predictions (both missed AD cases and the CN reference) put much of their weight on the black background and image corners, while AD predictions focus on brain tissue. Part of the evidence for a CN decision therefore seems to come from outside the brain, i.e. from global image appearance rather than anatomy. This fits the brightness sensitivity in Section 9 and the scan-wide errors above, but it is a hint, not proof of a shortcut.
+
+*Mitigation:* the reject option (Section 6) can at most help with the less confident errors; the most confident ones (scan P(AD) 0.05, 0.88, 0.92) would still be decided automatically and wrongly. So a CN prediction should never clear a patient on its own, and the next experiments are background masking (or skull-stripped input) and a scan-level intensity/acquisition audit (e.g. harmonisation across sequences), not more training of the same model.
 
 ## 8. Resource profile
 
@@ -297,7 +299,7 @@ Seeds 42 and 43 of ConvNeXt were trained on Rangpur (A100); ConvNeXt seed 44 and
 | Peak GPU memory: inference (3 models) / training (one model) | 100 MB / 225 MB | 406 MB / 624 MB (training measured on the L4) |
 | Wall-clock training per seed (30 epochs) | 52:42 and 52:02 on A100 (seeds 42, 43; Slurm) | about 45 min on L4 (not logged precisely) |
 
-All numbers are in [`run_logs/adni_v2/`](run_logs/adni_v2/). ConvNeXt **does not reach the 0.80 target** on the corrected split either.
+All numbers are in [`run_logs/adni_v2/`](run_logs/adni_v2/).
 
 ![Test confusion matrix, ConvNeXt, corrected split](figures/adni_v2_convnext_test_confusion.png)
 ![Test confusion matrix, MatchedCNN, corrected split](figures/adni_v2_matched_test_confusion.png)
