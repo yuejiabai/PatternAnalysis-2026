@@ -1,7 +1,7 @@
 run,split,input,optimizer,learning_rate,augmentation,intensity_augmentation,scheduler,epochs,best_val_accuracy,best_val_epoch,saved_epoch
 cnn/cnn_run01,strict,single,adam,0.001,False,False,none,3,0.7091603053435115,2,
 convnext/convnext_aug_adamw_run01,strict,single,adamw,0.0003,True,False,none,8,0.7774809160305344,7,
-convnext/convnext_cosine_run01,strict,single,adamw,0.0003,True,False,none,12,0.7790076335877862,9,
+convnext/convnext_cosine_run01,strict,single,adamw,0.0003,True,False,cosine,12,0.7790076335877862,9,
 convnext/convnext_intensity_adamw_run01,strict,single,adamw,0.0003,True,True,none,8,0.7770992366412214,7,7
 convnext/convnext_lr3e4_run01,strict,single,adam,0.0003,False,False,none,5,0.6366412213740458,3,
 convnext/convnext_patient_balanced_run01,strict,single,adamw,0.0003,True,False,none,8,0.7637404580152671,6,
