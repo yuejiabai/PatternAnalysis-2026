@@ -23,7 +23,7 @@ COMP3710 Pattern Recognition · Hard difficulty · Student s4985919 · Folder `r
 | Training recipe | [4](#4-training) |
 | Baseline comparison | [5](#5-baseline-comparison-official-split-identical-test-slices) (SimpleCNN), [10](#10-patient-leakage-re-evaluation-on-the-corrected-subject-disjoint-split) (parameter-matched CNN) |
 | Open dilemma: confidence, calibration and reject option | [6](#6-open-dilemma-confidence-calibration-and-a-reject-option) |
-| Failure analysis and five failure cases | [7](#7-where-and-why-it-fails-official-test-convnext-ensemble) |
+| Failure analysis: subgroups, five failure cases, Grad-CAM autopsy with visit checks | [7](#7-where-and-why-it-fails-official-test-convnext-ensemble) |
 | Resource profile (parameters, GPU memory, time) | [8](#8-resource-profile), [10.1](#101-results-test-202-unseen-subjects-9000-slices) |
 | Experiment history | [9](#9-experiment-history) |
 | Patient leakage and the corrected split | [10](#10-patient-leakage-re-evaluation-on-the-corrected-subject-disjoint-split) |
@@ -46,7 +46,7 @@ COMP3710 Pattern Recognition · Hard difficulty · Student s4985919 · Folder `r
 
 ![Example inputs and outputs](figures/example_inputs.png)
 
-*Data used in this project were obtained from the Alzheimer's Disease Neuroimaging Initiative (ADNI) database (adni.loni.usc.edu), through the course copy on Rangpur. Only these two example slices are shown; no other images and no scan or subject IDs are published.*
+*Data used in this project were obtained from the Alzheimer's Disease Neuroimaging Initiative (ADNI) database (adni.loni.usc.edu), through the course copy on Rangpur. Apart from these two examples, MRI slices are shown only in the failure-autopsy figures (Section 7); no scan or subject IDs are published.*
 
 
 ## 2. Headline results
@@ -166,7 +166,7 @@ Findings (correlational, not proven causes):
 
 ### Failure autopsies
 
-For each error type the most *confidently wrong* **scans** were selected (scan probability = mean of its 20 slices). These are deliberately worst cases, not average errors. Raw scan IDs stay local (`failure_cases_LOCAL_ONLY.csv`, git-ignored), and MRI images are not published.
+For each error type the most *confidently wrong* **scans** were selected (scan probability = mean of its 20 slices). These are deliberately worst cases, not average errors; the follow-up autopsy below adds typical errors. Raw scan IDs stay local (`failure_cases_LOCAL_ONLY.csv`, git-ignored).
 
 | # | Model | Truth → predicted | Scan P(AD) | Sequence, year | Subject seen in training? |
 |---|---|---|---|---|---|
@@ -176,11 +176,38 @@ For each error type the most *confidently wrong* **scans** were selected (scan p
 | 4 | ConvNeXt | CN → AD | 0.809 | Accelerated Sagittal MPRAGE, 2019 | yes |
 | 5 | SimpleCNN | AD → CN | 0.0004 | Accelerated Sagittal MPRAGE, 2018 | no |
 
-- **Cases 1–2 (missed AD at 95 % confidence).** New subjects, recent MPRAGE scans: exactly the group with 32 % AD recall. *Trigger hypothesis:* the network partly learned subject- or era-specific appearance instead of disease features, and recent AD scans of new subjects look like the recent CN scans it saw. *Check:* train with strict separation and compare AD recall by year on validation. *Mitigation:* strict subject-level training data, a validation set that matches the deployment era, never auto-clearing CN.
-- **Cases 3–4 (false alarm on CN).** Both subjects have another visit in the training folder. *Trigger hypothesis:* the subject was AD-labelled at another visit, or looks like one (diagnoses can change between ADNI visits). *Check:* compare with the labels of the subject's other visits in the metadata. *Mitigation:* audit per-visit labels before training.
+- **Cases 1–2 (missed AD at 95 % confidence).** New subjects, recent MPRAGE scans: exactly the group with 32 % AD recall. *Trigger hypothesis:* the network partly learned subject- or era-specific appearance instead of disease features, and recent AD scans of new subjects look like the recent CN scans it saw. *Check (done, see autopsy below):* the corrected split, which has no subject overlap, still produces confident whole-scan misses of AD, including a 2013 scan, so recent acquisition era alone does not explain all of them. *Mitigation:* strict subject-level training data, a validation set that matches the deployment era, never auto-clearing CN.
+- **Cases 3–4 (false alarm on CN).** Both subjects have another visit in the training folder. *Trigger hypothesis:* the subject was AD-labelled at another visit, or looks like one (diagnoses can change between ADNI visits). *Check (done for case 3 and for a typical false alarm, see autopsy below):* every other visit of those subjects is labelled CN, so a diagnosis change between visits does not explain them; the hypothesis is not supported. Case 4 itself was not re-checked.
 - **Case 5 (CNN, 99.96 % confident and wrong).** Shows that a small model's confidence can also be unreliable, even though its average calibration looks good.
 
 No clinical reading of the images is attempted; there was no radiologist input.
+
+### Failure autopsy with Grad-CAM and visit checks (`failure_autopsy.py`)
+
+To go beyond metadata, `failure_autopsy.py` re-scores the test split with the frozen ensemble and threshold and, for each error type, takes the most confidently wrong scan **and** a *typical* wrong scan (confidence closest to the median of all wrong scans of that type), plus one confidently correct AD and CN scan as a reference. For each case it shows the slice that pushed hardest towards the prediction with the ensemble's Grad-CAM map for the predicted class, counts how many of the scan's 20 slices are wrong, and lists the subject's other visits anywhere in the course folders with their labels. The figures show no IDs; raw IDs stay in a git-ignored CSV. Full numbers: `failure_autopsy.json` in `eval_autopsy_*` (local).
+
+![Failure autopsy, official split, ConvNeXt ensemble](figures/failure_autopsy_convnext.png)
+
+![Failure autopsy, corrected split, ConvNeXt ensemble](figures/adni_v2_failure_autopsy_convnext.png)
+
+| Split | Case | Truth → pred | Scan P(AD) | Wrong slices | Sequence, year | Subject in training? | Other visits (label, year) |
+|---|---|---|---|---|---|---|---|
+| official | missed AD, most confident | AD → CN | 0.05 | 20/20 | Accel. Sag. MPRAGE, 2018 | no | AD 2019 (test) |
+| official | missed AD, typical | AD → CN | 0.18 | 17/20 | MPRAGE, 2014 | **yes** | AD 2011, 2012 ×2 (train) |
+| official | false alarm, most confident | CN → AD | 0.88 | 20/20 | Accel. Sag. IR-FSPGR, 2021 | yes | CN 2017 (train) |
+| official | false alarm, typical | CN → AD | 0.59 | 15/20 | Sag. 3D Accel. MPRAGE, 2019 | yes | CN 2017 (train) |
+| corrected | missed AD, most confident | AD → CN | 0.05 | 20/20 | MPRAGE, 2013 | no | none |
+| corrected | missed AD, typical | AD → CN | 0.36 | 14/20 | Accel. Sag. IR-FSPGR, 2013 | no | AD 2012, 2014 (test) |
+| corrected | false alarm, most confident | CN → AD | 0.92 | 20/20 | Accel. Sag. MPRAGE, 2018 | no | CN 2017, 2020 (test) |
+| corrected | false alarm, typical | CN → AD | 0.70 | 16/20 | Accel. Sag. MPRAGE, 2018 | no | CN 2017, 2019 (test) |
+
+What the checks show (eight cases, so these are observations, not proof):
+1. **A diagnosis change between visits does not explain these cases.** None of the eight subjects has visits with different labels; every false alarm is a subject labelled CN at all of its visits, so the label-change hypothesis for cases 3–4 is not supported.
+2. **Errors are whole-scan, not a few bad slices.** 14–20 of the 20 slices are wrong in every error case, typical ones included, so the trigger is something that affects the whole scan (its overall appearance or acquisition), not slice position at the edges of the brain.
+3. **Seeing the subject in training does not protect against errors.** On the official split the typical missed AD comes from a subject with three AD-labelled visits in training, and both false alarms come from subjects whose CN visits were in training. So the model did not simply memorise subjects.
+4. **Acquisition era is not the whole story.** On the corrected split both selected missed AD scans are from 2013, the era in which AD recall is highest (80 %, Section 10.2). So era may contribute to the aggregate results (Section 10.2, finding 4), but it does not explain every confident error.
+
+*Mitigation:* the reject option (Section 6) can at most help with the less confident errors; the most confident ones (scan P(AD) 0.05, 0.88, 0.92) would still be decided automatically and wrongly. So a CN prediction should never clear a patient on its own, and the next experiment is a scan-level intensity/acquisition audit (e.g. harmonisation across sequences), not more training of the same model.
 
 ## 8. Resource profile
 
@@ -266,18 +293,24 @@ Seeds 42 and 43 of ConvNeXt were trained on Rangpur (A100); ConvNeXt seed 44 and
 | Wrong slices with confidence ≥ 0.9 | 561 | 65 |
 | Reject rule (90 % accepted accuracy fixed on validation): test coverage / accepted accuracy | 57.5 % / 86.6 % | 75.1 % / 92.3 % |
 | AD slices missed and not referred | 370 of 4,460 (8.3 %) | 320 of 4,460 (7.2 %) |
-| GPU forward time per slice, 3-model ensemble (A100) | 0.71 ms | 1.14 ms |
+| GPU forward time per slice, 3-model ensemble (A100) | 0.71 ms (separate run from Section 8's 0.587 ms; timings on the shared node vary by about ±0.3 ms) | 1.14 ms |
 | Peak GPU memory: inference (3 models) / training (one model) | 100 MB / 225 MB | 406 MB / 624 MB (training measured on the L4) |
 | Wall-clock training per seed (30 epochs) | 52:42 and 52:02 on A100 (seeds 42, 43; Slurm) | about 45 min on L4 (not logged precisely) |
 
 All numbers are in [`run_logs/adni_v2/`](run_logs/adni_v2/). ConvNeXt **does not reach the 0.80 target** on the corrected split either.
 
+![Test confusion matrix, ConvNeXt, corrected split](figures/adni_v2_convnext_test_confusion.png)
+![Test confusion matrix, MatchedCNN, corrected split](figures/adni_v2_matched_test_confusion.png)
+
+![ROC, ConvNeXt, corrected split](figures/adni_v2_convnext_roc.png)
+![ROC, MatchedCNN, corrected split](figures/adni_v2_matched_roc.png)
+
 ![Test accuracy by group, ConvNeXt, corrected split](figures/adni_v2_convnext_test_accuracy_by_group.png)
 ![Reliability diagram, MatchedCNN, corrected split](figures/adni_v2_matched_reliability.png)
 
-Further corrected-split plots. ConvNeXt: [confusion matrix](figures/adni_v2_convnext_test_confusion.png), [ROC](figures/adni_v2_convnext_roc.png), [coverage vs accuracy](figures/adni_v2_convnext_coverage_accuracy.png), [reliability](figures/adni_v2_convnext_reliability.png). MatchedCNN: [confusion matrix](figures/adni_v2_matched_test_confusion.png), [ROC](figures/adni_v2_matched_roc.png), [coverage vs accuracy](figures/adni_v2_matched_coverage_accuracy.png), [accuracy by group](figures/adni_v2_matched_test_accuracy_by_group.png).
+Further corrected-split plots. ConvNeXt: [coverage vs accuracy](figures/adni_v2_convnext_coverage_accuracy.png), [reliability](figures/adni_v2_convnext_reliability.png). MatchedCNN: [coverage vs accuracy](figures/adni_v2_matched_coverage_accuracy.png), [accuracy by group](figures/adni_v2_matched_test_accuracy_by_group.png).
 
-Validation and test differ by about 3 points in opposite directions for the two models (ConvNeXt 79.1 % → 76.2 %, MatchedCNN 83.8 % → 85.2 %). With only 96 validation and 202 test subjects, shifts of this size are plausible from which patients land in each split (no confidence interval was computed); the 9-point gap between the two models on the same 9,000 test slices is three times larger and has the same sign on validation (+4.6 points).
+From validation to test, ConvNeXt drops 2.9 points (79.1 % → 76.2 %) while MatchedCNN gains 1.4 points (83.8 % → 85.2 %). With only 96 validation and 202 test subjects, shifts of this size are plausible from which patients land in each split (no confidence interval was computed); the 9-point gap between the two models on the same 9,000 test slices is three times larger and has the same sign on validation (+4.6 points).
 
 ### 10.2 Findings
 
@@ -347,7 +380,7 @@ The corrected split (Section 10) changes the picture in two ways. First, with ev
 
 ## 13. Usage and reproducibility
 
-**Environment** (Rangpur conda env `torch117`): Python 3.10.21, torch 2.0.1+cu117, torchvision 0.15.2+cu117, numpy 1.26.4, matplotlib 3.10.9, Pillow 12.3.0. Seeds are fixed (Python, torch, data order); GPU convolutions are not forced to be deterministic, so repeated runs can differ slightly. Some corrected-split runs were trained on the EAIT GPU Lab (NVIDIA L4) with the same torch/torchvision versions (`torch 2.0.1+cu118`, `torchvision 0.15.2+cu118`; see `run_logs/adni_v2/gpulab_environment.txt`).
+**Environment** (Rangpur conda env `torch117`; pinned in `requirements.txt`): Python 3.10.21, torch 2.0.1+cu117, torchvision 0.15.2+cu117, numpy 1.26.4, matplotlib 3.10.9, Pillow 12.3.0. Seeds are fixed (Python, torch, data order); GPU convolutions are not forced to be deterministic, so repeated runs can differ slightly. Some corrected-split runs were trained on the EAIT GPU Lab (NVIDIA L4) with the same torch/torchvision versions (`torch 2.0.1+cu118`, `torchvision 0.15.2+cu118`; see `run_logs/adni_v2/gpulab_environment.txt`).
 
 ```bash
 # split summary (no training)
@@ -365,7 +398,8 @@ python -u train.py --model cnn --split-mode official --epochs 30 --batch-size 8 
   --scheduler cosine --warmup-epochs 1 --ema-decay 0.999 --label-smoothing 0.1 \
   --num-workers 4 --run-name cnn_official_cosine_ema_s42
 
-# inference with the saved ensemble (validation; add --split test --confirm-final-test for the frozen test run)
+# inference with the saved ensemble (validation; add --split test --confirm-final-test for the frozen test run);
+# also saves a confusion matrix and example slices to evaluation_results/ (local only)
 python -u predict.py --split validation --num-workers 4 \
   --checkpoint checkpoints/convnext/official_cosine_ema_context3_s4{2,3,4}/best.pth
 
@@ -386,6 +420,12 @@ python -u train.py --model cnn_matched --split-mode official --input-mode contex
 export ADNI_FINGERPRINT_ROOT_ALIASES=/home/s4985919/ADNI_v2/AD_NC
 python -u analyze.py --model cnn_matched --confirm-final-test --num-workers 4 --output-dir eval_v2/analysis_matched \
   --checkpoint checkpoints/cnn_matched/adni_v2_cnn_matched_s4{2,3,4}/best.pth
+
+# failure autopsy with Grad-CAM and visit checks (Section 7); repeat with the corrected-split
+# environment and checkpoints for figures/adni_v2_failure_autopsy_convnext.png
+python -u failure_autopsy.py --confirm-final-test --output-dir eval_autopsy_convnext \
+  --figure figures/failure_autopsy_convnext.png \
+  --checkpoint checkpoints/convnext/official_cosine_ema_context3_s4{2,3,4}/best.pth
 
 # parameter counts of all three models
 python baseline.py
@@ -410,11 +450,13 @@ Reject rule (chosen on validation for 90% accepted accuracy): confidence >= 0.92
 | File | Purpose |
 |---|---|
 | `modules.py` | ConvNeXt (LayerNorm2d, DropPath, ConvNeXtBlock, ConvNeXt); PyTorch only |
+| `requirements.txt` | Pinned package versions (Section 13) |
 | `baseline.py` | SimpleCNN baseline (23,714 parameters) and MatchedCNN, a plain CNN with a ConvNeXt-like parameter count (1,834,122); `python baseline.py` prints all parameter counts |
 | `dataset.py` | Subject IDs from metadata, strict/official splits, subject-level validation split, `single`/`context3` input, training-only augmentation |
 | `train.py` | Training, validation each epoch, checkpoint selection, resumable checkpoints, training curves; `--test-only` calls `predict.py` |
-| `predict.py` | Loads saved weights (by default the final 3-seed ensemble), slice/scan/patient metrics, guarded test access, seen/unseen subject breakdown; prints and saves metrics only — the plots are produced by `analyze.py`, which reuses its functions |
+| `predict.py` | Loads saved weights (by default the final 3-seed ensemble), slice/scan/patient metrics, guarded test access, seen/unseen subject breakdown; saves a slice-level confusion matrix and an example-predictions figure (most confident TP/FN/FP/TN slices with P(AD); kept local because it shows MRI pixels; `--no-plots` to skip). The fuller analysis plots come from `analyze.py` |
 | `analyze.py` | Calibration (ECE, Brier, reliability), reject rule, ROC, confusion, subgroup accuracy, failure cases, resource profile, figures |
+| `failure_autopsy.py` | Qualitative failure autopsy on test: most-confident and typical errors of each type plus correct references, Grad-CAM of the ensemble, wrong-slice count per scan, and a check of each subject's other visits (labels, years, train/test folder). Figure has no IDs; raw IDs only in a git-ignored CSV |
 | `mri_intensity.py` | Optional training-only intensity augmentation |
 | `diagnose_development.py` | Read-only audit of the development data (subject overlap, mixed labels, split fingerprints) |
 | `test_brightness_sensitivity.py` | Validation-only brightness sensitivity experiment (a script, not a unit test) |
@@ -426,9 +468,9 @@ Reject rule (chosen on validation for 90% accepted accuracy): confidence >= 0.92
 | `run_logs/evaluation/` | Original `analyze.py` outputs (`analysis_convnext_ensemble.json`, `analysis_cnn.json`): every validation/test number, reject-rule, subgroup, failure-case and resource figure in Sections 2 and 5–8; plus the `predict.py` metric files of earlier evaluations (named `<project>__<output folder>__<file>.json`, e.g. the strict-split test run of Section 9). No scan or subject IDs |
 | `run_logs/slurm/`, `run_logs/diagnostics/` | Slurm accounting for the training times, and aggregate outputs of the development audit and brightness experiment; `run_logs/README.md` explains every file |
 | `run_logs/adni_v2/` | Corrected subject-disjoint split (Section 10): evaluation protocol committed before testing, training logs of the six runs, Slurm records, GPU Lab environment and all evaluation outputs |
-| `figures/` | Plots used in this README (`adni_v2_*`: corrected split); the only MRI content is the two example slices in `example_inputs.png` |
+| `figures/` | Plots used in this README (`adni_v2_*`: corrected split); MRI content appears only in `example_inputs.png` and the two `*failure_autopsy_convnext.png` figures, without IDs |
 
-Datasets, checkpoints, raw Slurm output files (`*.out`), raw scan IDs and MRI montages are not committed (`.gitignore`). The logs in `run_logs/` are cleaned copies with settings and aggregate metrics only.
+Datasets, checkpoints, raw Slurm output files (`*.out`), raw scan IDs, `predict.py` example slices and the `analyze.py` MRI montages are not committed (`.gitignore`). The logs in `run_logs/` are cleaned copies with settings and aggregate metrics only.
 
 ## 14. Artificial Intelligence Usage Disclosure
 
