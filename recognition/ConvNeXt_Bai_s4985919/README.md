@@ -266,7 +266,7 @@ Seeds 42 and 43 of ConvNeXt were trained on Rangpur (A100); ConvNeXt seed 44 and
 | Wrong slices with confidence ≥ 0.9 | 561 | 65 |
 | Reject rule (90 % accepted accuracy fixed on validation): test coverage / accepted accuracy | 57.5 % / 86.6 % | 75.1 % / 92.3 % |
 | AD slices missed and not referred | 370 of 4,460 (8.3 %) | 320 of 4,460 (7.2 %) |
-| GPU forward time per slice, 3-model ensemble (A100) | 0.71 ms | 1.14 ms |
+| GPU forward time per slice, 3-model ensemble (A100) | 0.71 ms (separate run from Section 8's 0.587 ms; timings on the shared node vary by about ±0.3 ms) | 1.14 ms |
 | Peak GPU memory: inference (3 models) / training (one model) | 100 MB / 225 MB | 406 MB / 624 MB (training measured on the L4) |
 | Wall-clock training per seed (30 epochs) | 52:42 and 52:02 on A100 (seeds 42, 43; Slurm) | about 45 min on L4 (not logged precisely) |
 
@@ -347,7 +347,7 @@ The corrected split (Section 10) changes the picture in two ways. First, with ev
 
 ## 13. Usage and reproducibility
 
-**Environment** (Rangpur conda env `torch117`): Python 3.10.21, torch 2.0.1+cu117, torchvision 0.15.2+cu117, numpy 1.26.4, matplotlib 3.10.9, Pillow 12.3.0. Seeds are fixed (Python, torch, data order); GPU convolutions are not forced to be deterministic, so repeated runs can differ slightly. Some corrected-split runs were trained on the EAIT GPU Lab (NVIDIA L4) with the same torch/torchvision versions (`torch 2.0.1+cu118`, `torchvision 0.15.2+cu118`; see `run_logs/adni_v2/gpulab_environment.txt`).
+**Environment** (Rangpur conda env `torch117`; pinned in `requirements.txt`): Python 3.10.21, torch 2.0.1+cu117, torchvision 0.15.2+cu117, numpy 1.26.4, matplotlib 3.10.9, Pillow 12.3.0. Seeds are fixed (Python, torch, data order); GPU convolutions are not forced to be deterministic, so repeated runs can differ slightly. Some corrected-split runs were trained on the EAIT GPU Lab (NVIDIA L4) with the same torch/torchvision versions (`torch 2.0.1+cu118`, `torchvision 0.15.2+cu118`; see `run_logs/adni_v2/gpulab_environment.txt`).
 
 ```bash
 # split summary (no training)
@@ -410,11 +410,13 @@ Reject rule (chosen on validation for 90% accepted accuracy): confidence >= 0.92
 | File | Purpose |
 |---|---|
 | `modules.py` | ConvNeXt (LayerNorm2d, DropPath, ConvNeXtBlock, ConvNeXt); PyTorch only |
+| `requirements.txt` | Pinned package versions (Section 13) |
 | `baseline.py` | SimpleCNN baseline (23,714 parameters) and MatchedCNN, a plain CNN with a ConvNeXt-like parameter count (1,834,122); `python baseline.py` prints all parameter counts |
 | `dataset.py` | Subject IDs from metadata, strict/official splits, subject-level validation split, `single`/`context3` input, training-only augmentation |
 | `train.py` | Training, validation each epoch, checkpoint selection, resumable checkpoints, training curves; `--test-only` calls `predict.py` |
-| `predict.py` | Loads saved weights (by default the final 3-seed ensemble), slice/scan/patient metrics, guarded test access, seen/unseen subject breakdown; prints and saves metrics only — the plots are produced by `analyze.py`, which reuses its functions |
+| `predict.py` | Loads saved weights (by default the final 3-seed ensemble), slice/scan/patient metrics, guarded test access, seen/unseen subject breakdown; saves a slice-level confusion matrix and an example-predictions figure (most confident TP/FN/FP/TN slices with P(AD); kept local because it shows MRI pixels; `--no-plots` to skip). The fuller analysis plots come from `analyze.py` |
 | `analyze.py` | Calibration (ECE, Brier, reliability), reject rule, ROC, confusion, subgroup accuracy, failure cases, resource profile, figures |
+| `failure_autopsy.py` | Qualitative failure autopsy on test: most-confident and typical errors of each type plus correct references, Grad-CAM of the ensemble, wrong-slice count per scan, and a check of each subject's other visits (labels, years, train/test folder). Figure has no IDs; raw IDs only in a git-ignored CSV |
 | `mri_intensity.py` | Optional training-only intensity augmentation |
 | `diagnose_development.py` | Read-only audit of the development data (subject overlap, mixed labels, split fingerprints) |
 | `test_brightness_sensitivity.py` | Validation-only brightness sensitivity experiment (a script, not a unit test) |

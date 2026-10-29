@@ -50,7 +50,9 @@ def main(roots):
                 "learning_rate": config.get("learning_rate"),
                 "augmentation": config.get("training_augmentation", False),
                 "intensity_augmentation": bool(config.get("intensity_augmentation")),
-                "scheduler": config.get("scheduler", "none"),
+                # Early configs stored the key as "scheduler_name".
+                "scheduler": (config.get("scheduler")
+                              or config.get("scheduler_name") or "none"),
                 "epochs": len(history),
                 "best_val_accuracy": accuracy[top],
                 "best_val_epoch": top + 1,

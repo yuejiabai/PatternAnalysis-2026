@@ -317,6 +317,65 @@ def save_anonymized_details(path, records, threshold, salt):
             ])
 
 
+def save_example_predictions(slices, threshold, path, per_cell=2):
+    """Grid of test slices with true label, prediction and P(AD).
+
+    For each confusion cell (TP, FN, FP, TN) the most confident slices are
+    shown, so the figure has both clear successes and the worst mistakes.
+    The figure contains MRI pixels: keep it local, do not commit it.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from PIL import Image
+
+    cells = {("AD", "AD"): [], ("AD", "NC"): [], ("NC", "AD"): [], ("NC", "NC"): []}
+    for slice_path, score, label in slices:
+        true = "AD" if label == 0 else "NC"
+        pred = "AD" if score >= threshold else "NC"
+        confidence = score if pred == "AD" else 1 - score
+        cells[(true, pred)].append((confidence, slice_path, score))
+
+    fig, axes = plt.subplots(len(cells), per_cell, figsize=(2.4 * per_cell, 2.6 * len(cells)),
+                             squeeze=False)
+    for row, ((true, pred), entries) in enumerate(cells.items()):
+        # Most confident first: for wrong cells these are the worst errors.
+        entries.sort(reverse=True)
+        for col in range(per_cell):
+            ax = axes[row][col]
+            ax.axis("off")
+            if col >= len(entries):
+                continue
+            _, slice_path, score = entries[col]
+            ax.imshow(Image.open(slice_path).convert("L"), cmap="gray")
+            colour = "green" if true == pred else "red"
+            ax.set_title(f"true {true} / pred {pred}\nP(AD)={score:.2f}",
+                         fontsize=8, color=colour)
+    fig.suptitle(f"Example predictions (threshold {threshold:.2f})", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+
+
+def save_figures(records, result_by_level, args):
+    """Visualise the evaluation: slice-level confusion matrix and example slices."""
+    # Lazy import: analyze.py imports this module, so importing it at the top
+    # would be circular. plot_confusion is the same function used in the README.
+    from analyze import plot_confusion
+
+    slice_result = result_by_level["slice"]
+    confusion_path = args.output_dir / f"{args.split}_confusion.png"
+    plot_confusion(slice_result["tp_ad"], slice_result["fn_ad"], slice_result["fp_ad"],
+                   slice_result["tn_ad"],
+                   f"{args.model}, {args.split} slices (acc {slice_result['accuracy']:.1%})",
+                   confusion_path)
+    print("Saved confusion matrix:", confusion_path)
+
+    examples_path = args.output_dir / f"{args.split}_examples.png"
+    save_example_predictions(records["slice"], args.threshold, examples_path)
+    print("Saved example predictions (contains MRI pixels, keep local):", examples_path)
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--split", choices=["validation", "test"], default="validation")
@@ -340,6 +399,8 @@ def parse_args():
                    help="Write pseudonymous slice/scan/patient prediction CSVs")
     p.add_argument("--id-salt", default="local-analysis-only",
                    help="Salt for pseudonymous IDs; do not publish detailed CSVs")
+    p.add_argument("--no-plots", action="store_true",
+                   help="Skip the confusion-matrix and example-slice figures")
     args = p.parse_args()
     if args.threshold is not None and not (0 < args.threshold < 1):
         p.error("Threshold must be strictly between 0 and 1")
@@ -503,6 +564,9 @@ def main():
     with path.open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
     print("Saved aggregate results:", path)
+
+    if not args.no_plots:
+        save_figures(records, result_by_level, args)
 
     if args.save_details:
         for level in ("slice", "scan", "patient"):
